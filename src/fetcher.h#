@@ -1,0 +1,301 @@
+mod manifest
+mod lockfile
+mod registry
+mod store
+mod ui
+
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+pub fn install_all(m: manifest::Manifest, release: bool, verbose: bool) -> bool is
+    let ok_libs: bool = install_h_sharp_deps(m, verbose)
+    let ok_py:   bool = install_python_deps(m, verbose)
+    return ok_libs && ok_py
+end
+
+;; A small result struct instead of a `(bool, string)` tuple: reading
+;; `.0` off a tuple containing a non-Copy `string` field moves the WHOLE
+;; tuple under this compiler's ownership checker, so a later `.1` read
+;; on the same local gets flagged "used after being moved". A struct's
+;; fields don't have that restriction.
+struct FetchResult is
+    pub ok:   bool
+    pub note: string
+end
+
+fn install_h_sharp_deps(m: manifest::Manifest, verbose: bool) -> bool is
+    let total: int = manifest::deps_len(m)
+    if total == 0 is return true end
+
+    store::ensure_store()
+
+    let mut locks:  lockfile::LockSet = lockfile::read_lock()
+    let mut block:  ui::StatusBlock   = ui::block_new(total, "default", "deps", "Fetching")
+    let mut failed: int = 0
+    let mut i:      int = 0
+
+    block = ui::block_step(block, to_string(total) + " dependency(ies)…")
+
+    while i < total is
+        let dep:      manifest::DependencyLine = manifest::dep_at(m, i)
+        let dep_name: string = manifest::dep_name(dep)
+        let dep_kind: string = manifest::dep_kind(dep)
+        let dep_src:  string = manifest::dep_source(dep)
+
+        let source_key: string = resolve_source_key(dep_name, dep_kind, dep_src)
+        let slot: string = store::dep_slot(dep_name, dep_kind, source_key)
+        let locked: lockfile::LockedDep = lockfile::lock_get(locks, dep_name)
+
+        ;; A `path` dependency always re-links (see install_path_dep) —
+        ;; it tracks its local source live, never a frozen snapshot, so
+        ;; a lockfile hit alone is never trusted for it the way it is
+        ;; for every other kind.
+        if lockfile::locked_name(locked) != "" && store::slot_exists(slot) && dep_kind != "path" is
+            block = ui::block_step(block, dep_name + " (cached)")
+            if verbose is ui::block_note(block, "  \x1b[2m" + dep_name + " (cached)\x1b[0m") end
+            block = ui::block_advance(block, 1)
+            i += 1
+            continue
+        end
+
+        block = ui::block_step(block, dep_name + match dep_kind is
+            "git"                => " (cloning…)"
+            "path"               => " (linking local path…)"
+            "version"            => " (fetching " + dep_src + "…)"
+            "newest"             => " (syncing to newest…)"
+            "dynamic" | "static" => " (checking system lib…)"
+            _                    => " (registry lookup…)"
+        end)
+
+        let result: FetchResult = match dep_kind is
+            "git"     => is install_git_dep(dep_name, dep_src, slot, verbose) end
+            "path"    => is install_path_dep(dep_name, dep_src, slot, verbose) end
+            "vira"    => is install_registry_dep(dep_name, slot, verbose) end
+            "version" => is install_pinned_dep(dep_name, dep_src, slot, verbose) end
+            "newest"  => is install_newest_dep(dep_name, slot, verbose) end
+            "dynamic" | "static" => is
+                FetchResult { ok: true, note: if verbose then "  \x1b[2m" + dep_name + " (system lib)\x1b[0m" else "" }
+            end
+            _ => is
+                FetchResult { ok: true, note: if verbose then "  \x1b[2m" + dep_name + " (unknown kind " + dep_kind + ")\x1b[0m" else "" }
+            end
+        end
+
+        if result.note != "" is ui::block_note(block, result.note) end
+
+        if result.ok is
+            locks = lockfile::lock_set(locks, dep_name, dep_src, dep_src, "")
+        else is
+            ui::block_note(block, "  \x1b[33mwarn:\x1b[0m  failed to fetch " + dep_name)
+            failed += 1
+        end
+
+        block = ui::block_advance(block, 1)
+        i += 1
+    end
+
+    lockfile::write_lock(locks)
+    ui::block_finish(block, to_string(total - failed) + " package(s) ready — " + store::packages_root())
+
+    return failed == 0
+end
+
+;; What actually gets fingerprinted for a slot: the thing that, if it
+;; changed, should mean a DIFFERENT cache directory. A `newest` dep has
+;; no fixed source text of its own (it always tracks HEAD), so its name
+;; alone would collide across totally unrelated `newest` deps sharing a
+;; name — qualify it with the kind itself instead. A `path` dep's slot
+;; is keyed off its resolved absolute directory, computed the same way
+;; `install_path_dep` resolves it for the actual `ln`.
+fn resolve_source_key(name: string, kind: string, source: string) -> string is
+    return match kind is
+        "newest" => name + "@newest"
+        "path"   => absolute_path(source)
+        _        => if source != "" then source else name
+    end
+end
+
+fn absolute_path(rel_or_abs: string) -> string is
+    if string_starts_with(rel_or_abs, "/") is return rel_or_abs end
+    let tmp: string = "/tmp/vira_pwd_" + to_string(proc_id()) + ".txt"
+    system("pwd > " + tmp)
+    let cwd: string = string_trim(file_read(tmp))
+    file_delete(tmp)
+    return cwd + "/" + rel_or_abs
+end
+
+fn install_git_dep(name: string, url: string, slot: string, verbose: bool) -> FetchResult is
+    if store::slot_exists(slot) is
+        return FetchResult { ok: true, note: if verbose then "  \x1b[2m" + name + " (git cached)\x1b[0m" else "" }
+    end
+    let cmd: string = "git clone --depth=1 '" + url + "' '" + slot + "' 2>/dev/null"
+    let note: string = if verbose then "  \x1b[2m$ " + cmd + "\x1b[0m" else ""
+    return FetchResult { ok: system(cmd) == 0, note: note }
+end
+
+;; `-> name => vX.Y[.Z]` — same tag-checkout behaviour bytes uses,
+;; against the same registry, just landing in the shared store.
+fn install_git_dep_tag(name: string, url: string, version_spec: string, slot: string, verbose: bool) -> FetchResult is
+    if store::slot_exists(slot) is
+        return FetchResult { ok: true, note: if verbose then "  \x1b[2m" + name + " (git cached @ " + version_spec + ")\x1b[0m" else "" }
+    end
+    let tag: string = if string_starts_with(version_spec, "v") then version_spec else "v" + version_spec
+    let cmd: string = "git clone --depth=1 --branch '" + tag + "' '" + url + "' '" + slot + "' 2>/dev/null"
+    let note: string = if verbose then "  \x1b[2m$ " + cmd + "\x1b[0m" else ""
+    return FetchResult { ok: system(cmd) == 0, note: note }
+end
+
+;; `-> name => path:<dir>` or a bare `./dir`/`../dir`/`/abs/dir` — a
+;; sibling package that already lives on disk. Never touches git or the
+;; registry: `dir` is symlinked into its global slot (re-made fresh
+;; every run, since a path dep tracks local edits live rather than
+;; being a frozen snapshot the way a fetched dep is), so the compiler's
+;; ordinary package resolution finds it exactly like anything fetched.
+fn install_path_dep(name: string, rel_or_abs: string, slot: string, verbose: bool) -> FetchResult is
+    if rel_or_abs == "" is
+        return FetchResult { ok: false, note: "  \x1b[31merror:\x1b[0m path dependency '" + name + "' has no directory" }
+    end
+    if !dir_exists(rel_or_abs) is
+        return FetchResult { ok: false, note: "  \x1b[31merror:\x1b[0m path dependency '" + name + "' points at '" +
+                        rel_or_abs + "', which doesn't exist (relative to the project root)" }
+    end
+
+    if dir_exists(slot) || file_exists(slot) is
+        system("rm -rf '" + slot + "'")
+    end
+
+    let target: string = if string_starts_with(rel_or_abs, "/") then "'" + rel_or_abs + "'"
+                          else "\"$(pwd)/" + rel_or_abs + "\""
+    let rc: int = system("ln -sfn " + target + " '" + slot + "'")
+    let note: string = if rc != 0 then "  \x1b[31merror:\x1b[0m failed to link local path '" + rel_or_abs + "' for '" + name + "'"
+                        else if verbose then "  \x1b[2m" + name + " (local path: " + rel_or_abs + ")\x1b[0m"
+                        else ""
+    return FetchResult { ok: rc == 0, note: note }
+end
+
+fn install_registry_dep(name: string, slot: string, verbose: bool) -> FetchResult is
+    let idx: registry::Index = registry::load_cached()
+    let entry: registry::PackageRef = registry::find(idx, name)
+
+    if registry::ref_name(entry) == "" is
+        let stub: string = store::packages_root() + "/" + name + "-unresolved.h#"
+        file_write(stub, ";; vira stub: " + name + "\n;; Install via: vira add " + name + "\n")
+        return FetchResult { ok: true, note: "  \x1b[33mwarn:\x1b[0m '" + name + "' not in registry, stub created" }
+    end
+
+    return install_git_dep(name, registry::ref_git(entry), slot, verbose)
+end
+
+fn install_pinned_dep(name: string, version_spec: string, slot: string, verbose: bool) -> FetchResult is
+    let idx: registry::Index = registry::load_cached()
+    let entry: registry::PackageRef = registry::find(idx, name)
+
+    if registry::ref_name(entry) == "" is
+        return FetchResult { ok: false, note: "  \x1b[31merror:\x1b[0m '" + name + "' not in registry — cannot pin to " + version_spec }
+    end
+
+    return install_git_dep_tag(name, registry::ref_git(entry), version_spec, slot, verbose)
+end
+
+;; `-> name => newest` — always take the latest revision, fast-forwarded
+;; in place if it's already cloned into its slot.
+fn install_newest_dep(name: string, slot: string, verbose: bool) -> FetchResult is
+    let idx: registry::Index = registry::load_cached()
+    let entry: registry::PackageRef = registry::find(idx, name)
+
+    if registry::ref_name(entry) == "" is
+        let stub: string = store::packages_root() + "/" + name + "-unresolved.h#"
+        file_write(stub, ";; vira stub: " + name + "\n;; Install via: vira add " + name + "\n")
+        return FetchResult { ok: true, note: "  \x1b[33mwarn:\x1b[0m '" + name + "' not in registry, stub created" }
+    end
+
+    if store::slot_exists(slot) is
+        system("git -C '" + slot + "' pull --ff-only 2>/dev/null")
+        let note: string = if verbose then "  \x1b[2m" + name + " (synced to newest)\x1b[0m" else ""
+        return FetchResult { ok: true, note: note }
+    end
+
+    return install_git_dep(name, registry::ref_git(entry), slot, verbose)
+end
+
+;; ── Python side ──────────────────────────────────────────────────────────────
+;; Left as a no-op hook, same as bytes: real `[python]`-section support
+;; is still future work there too — `vira python <pkg>` (see shell.h#)
+;; is the actually-wired entry point for Python packages today.
+fn install_python_deps(m: manifest::Manifest, verbose: bool) -> bool is
+    return true
+end
+
+;; ── add / remove (edits Bytes.hk in place) ──────────────────────────────────
+
+pub fn add_dependency(name: string, kind: string, source: string, verbose: bool) -> int is
+    let path: string = manifest::find_manifest()
+    if path == "" is
+        write("  \x1b[31merror:\x1b[0m no Bytes.hk found")
+        return 1
+    end
+
+    let content: string = file_read(path)
+    let header: string = if string_contains(content, "[deps]") then "[deps]"
+                          else if string_contains(content, "[dependencies]") then "[dependencies]"
+                          else ""
+    let new_line: string = "-> " + name + " => " + if source != "" then source else kind
+
+    let updated: string = if header != "" is
+        string_replace(content, header, header + "\n" + new_line)
+    else is
+        content + "\n[deps]\n" + new_line + "\n"
+    end
+
+    file_write(path, updated)
+    write("  \x1b[32m✓\x1b[0m  added: " + name + if kind != "" then " [" + kind + "]" else "")
+
+    if kind == "git" || string_starts_with(source, "http") is
+        store::ensure_store()
+        let slot: string = store::dep_slot(name, "git", source)
+        let result: FetchResult = install_git_dep(name, source, slot, verbose)
+        if result.note != "" is write(result.note) end
+    end
+
+    write("  Run 'vira build' to compile")
+    return 0
+end
+
+pub fn remove_dependency(name: string) -> int is
+    let path: string = manifest::find_manifest()
+    if path == "" is
+        write("  \x1b[31merror:\x1b[0m no Bytes.hk found")
+        return 1
+    end
+
+    let lines: [string] = string_split(file_read(path), "\n")
+    let n: int = array_len(lines)
+    let mut rebuilt: string = ""
+    let mut removed: bool = false
+    let mut i: int = 0
+
+    while i < n is
+        let key: string = manifest::key_of(lines[i])
+        if key == name && string_starts_with(string_trim(lines[i]), "->") is
+            removed = true
+        else is
+            rebuilt = rebuilt + lines[i] + "\n"
+        end
+        i += 1
+    end
+
+    if !removed is
+        write("  \x1b[33mwarn:\x1b[0m '" + name + "' not found in [deps]")
+        return 1
+    end
+
+    file_write(path, rebuilt)
+
+    let mut locks: lockfile::LockSet = lockfile::read_lock()
+    locks = lockfile::lock_unset(locks, name)
+    lockfile::write_lock(locks)
+
+    write("  \x1b[32m✓\x1b[0m  removed: " + name)
+    return 0
+end
