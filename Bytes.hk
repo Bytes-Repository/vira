@@ -1,1 +1,14 @@
+[package]
+-> name        => vira
+-> version     => 0.0.1
+-> description => H# Package Manager (libraries fetched into ~/.hsharp/bytes-io/)
+-> author      => Bytes Developers
+-> license     => MIT
 
+[build]
+-> lang   => h#
+-> entry  => src/main.h#
+-> output => build/vira
+
+[deps]
+-> libc => dynamic
