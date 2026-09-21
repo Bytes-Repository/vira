@@ -1,0 +1,110 @@
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+pub struct PackageRef is
+    pub name:    string
+    pub git:     string
+    pub version: string
+end
+
+pub struct Index is
+    pub entries: [PackageRef]
+    pub count:   int
+end
+
+;; Same-module accessors — a `PackageRef.name`/`.git` read from another
+;; module risks the cross-module field-guessing ambiguity noted in
+;; manifest.h# (`DependencyLine`/`LockedDep` both also have `.name`).
+pub fn ref_name(e: PackageRef)    -> string is return e.name    end
+pub fn ref_git(e: PackageRef)     -> string is return e.git     end
+pub fn ref_version(e: PackageRef) -> string is return e.version end
+
+;; `Index.count` collides in name with `lockfile::LockSet.count` — same
+;; cross-module field-guessing hazard noted in manifest.h#, so it gets
+;; the same same-module-accessor treatment.
+pub fn index_count(idx: Index) -> int is return idx.count end
+
+fn index_url() -> string is
+    return "https://raw.githubusercontent.com/Bytes-Repository/repository/main/index.json"
+end
+
+fn cache_file() -> string is
+    return "build/cache/registry-index.json"
+end
+
+pub fn fetch_fresh() -> Index is
+    let tmp: string = "/tmp/vira_registry_" + to_string(proc_id()) + ".json"
+    let rc: int = system("curl -fsSL --max-time 10 '" + index_url() + "' -o " + tmp + " 2>/dev/null")
+    if rc != 0 is
+        write("  \x1b[33mwarn:\x1b[0m couldn't reach the package registry (offline?)")
+        return Index { entries: [], count: 0 }
+    end
+    if !file_exists(tmp) is return Index { entries: [], count: 0 } end
+
+    let body: string = file_read(tmp)
+    file_delete(tmp)
+
+    if dir_exists("build/cache") is
+        file_write(cache_file(), body)
+    end
+
+    return parse_index(body)
+end
+
+pub fn load_cached() -> Index is
+    if file_exists(cache_file()) is
+        return parse_index(file_read(cache_file()))
+    end
+    return fetch_fresh()
+end
+
+pub fn parse_index(json: string) -> Index is
+    ;; The index is a flat `[{"name":"git-url"}, ...]` array.
+    let mut entries: [PackageRef] = []
+    let mut count:   int          = 0
+
+    let objects: [string] = string_split(json, "},{")
+    let n: int = array_len(objects)
+    let mut i: int = 0
+
+    while i < n is
+        let stripped: string = string_replace(string_replace(objects[i], "{", ""), "}", "")
+        let quoted: [string] = string_split(stripped, "\"")
+        ;; quoted -> ["", name, ":", url, ""]
+        if array_len(quoted) >= 4 is
+            let name: string = string_trim(quoted[1])
+            let url:  string = string_trim(quoted[3])
+            if name != "" && url != "" is
+                entries = array_push(entries, PackageRef { name: name, git: url, version: "latest" })
+                count += 1
+            end
+        end
+        i += 1
+    end
+
+    return Index { entries: entries, count: count }
+end
+
+pub fn find(idx: Index, name: string) -> PackageRef is
+    let mut i: int = 0
+    while i < idx.count is
+        if idx.entries[i].name == name is return idx.entries[i] end
+        i += 1
+    end
+    return PackageRef { name: "", git: "", version: "" }
+end
+
+pub fn search(idx: Index, query: string) -> [PackageRef] is
+    let mut hits: [PackageRef] = []
+    let q: string = string_lower(query)
+    let mut i: int = 0
+    while i < idx.count is
+        let e: PackageRef = idx.entries[i]
+        if string_contains(string_lower(e.name), q) is
+            hits = array_push(hits, e)
+        end
+        i += 1
+    end
+    return hits
+end
