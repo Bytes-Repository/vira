@@ -1,0 +1,324 @@
+mod manifest
+mod ui
+
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+fn find_h_sharp() -> string is
+    let bins: [string] = ["h#", "hsharp", "./h#"]
+    for b in bins is
+        if system("command -v " + b + " >/dev/null 2>&1") == 0 is return b end
+    end
+    return "h#"
+end
+
+fn basename(path: string) -> string is
+    let slash: int = string_rfind(path, "/")
+    if slash >= 0 is return string_slice(path, slash + 1, string_len(path)) end
+    return path
+end
+
+fn shquote(s: string) -> string is
+    return "'" + string_replace_all(s, "'", "'\\''") + "'"
+end
+
+;; ── Toolchain preflight ───────────────────────────────────────────────────────
+
+struct Toolchain is
+    pub lang:    string
+    pub binary:  string
+    pub hint:    string
+    pub present: bool
+end
+
+fn probe_toolchain(lang: string) -> Toolchain is
+    let binary: string = match lang is
+        "h#" | "hsharp" => find_h_sharp()
+        "rust"          => "cargo"
+        "c++" | "cpp"   => "c++"
+        "c"             => "cc"
+        "odin"          => "odin"
+        "zig"           => "zig"
+        "crystal"       => "crystal"
+        "go" | "golang" => "go"
+        "python" | "py" => "python3"
+        _               => lang
+    end
+    let hint: string = match lang is
+        "h#" | "hsharp" => "part of the H# toolchain"
+        "rust"          => "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        "c++" | "cpp"   => "sudo apt install g++"
+        "c"             => "sudo apt install gcc"
+        "odin"          => "https://odin-lang.org/docs/install"
+        "zig"           => "sudo snap install zig --beta --classic"
+        "crystal"       => "sudo apt install crystal"
+        "go" | "golang" => "sudo apt install golang"
+        "python" | "py" => "sudo apt install python3"
+        _               => "check PATH"
+    end
+    return Toolchain { lang: lang, binary: binary, hint: hint, present: system("command -v " + binary + " >/dev/null 2>&1") == 0 }
+end
+
+;; ── One member ───────────────────────────────────────────────────────────────
+
+pub fn build_member(name: string, lang: string, release: bool, verbose: bool) -> ui::MemberOutcome is
+    let t0: int = time_ms()
+
+    if verbose is write("  \x1b[2m» building member '" + name + "' (" + lang + ")\x1b[0m") end
+
+    let mut member_dir: string = name + ""
+    if !dir_exists(name) is
+        let root: string = env_get("VIRA_WORKSPACE_ROOT")
+        if root != "" is
+            let abs: string = root + "/" + name
+            if dir_exists(abs) is member_dir = abs end
+        end
+    end
+
+    if !dir_exists(member_dir) is
+        return ui::MemberOutcome { name: name, lang: lang, success: false, elapsed: time_ms() - t0, bin_path: "" }
+    end
+
+    if !dir_exists(member_dir + "/build") is dir_create(member_dir + "/build") end
+
+    let rel: string = if release then " --release" else ""
+    let mut ok: bool = false
+    let mut bin: string = ""
+    let spin: string = name + " \x1b[2m(" + lang + ")\x1b[0m"
+
+    match lang is
+        "h#" | "hsharp" => is
+            let member_hk: string = member_dir + "/Bytes.hk"
+            let has_own: bool = file_exists(member_hk)
+
+            let entry: string = if has_own is
+                member_dir + "/" + manifest::build_entry(manifest::load_from(member_hk))
+            else is member_dir + "/src/main.h#" end
+
+            let out: string = if has_own is
+                member_dir + "/" + manifest::build_output(manifest::load_from(member_hk))
+            else is member_dir + "/build/main" end
+
+            let emit_arg: string = if has_own is
+                let mp: manifest::Manifest = manifest::load_from(member_hk)
+                if mp.build.emit != "" && mp.build.emit != "bin" then " --emit " + mp.build.emit else ""
+            else ""
+            end
+
+            let include_arg: string = if has_own is
+                let mp: manifest::Manifest = manifest::load_from(member_hk)
+                if mp.build.include != "" then " -I " + member_dir + "/" + mp.build.include else ""
+            else ""
+            end
+
+            let cmd: string = find_h_sharp() + " compile " + entry + " -o " + out + rel + emit_arg + include_arg
+            if verbose is write("  \x1b[2m$ " + cmd + "\x1b[0m") end
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "rust" => is
+            let manifest_path: string = member_dir + "/Cargo.toml"
+            let cmd: string = "cargo build" + rel + " --manifest-path " + manifest_path
+            ok = ui::run_streaming(cmd, spin) == 0
+        end
+        "c++" | "cpp" => is
+            let out: string = member_dir + "/build/lib" + name + ".so"
+            let opt: string = if release then " -O3 -flto" else " -O0 -g"
+            let cmd: string = "c++ -shared -fPIC -std=c++17 " + member_dir + "/src/*.cpp -o " + out + opt
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "c" => is
+            let out: string = member_dir + "/build/lib" + name + ".so"
+            let opt: string = if release then " -O2" else " -O0 -g"
+            let cmd: string = "cc -shared -fPIC " + member_dir + "/src/*.c -o " + out + opt
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "odin" => is
+            let out: string = member_dir + "/build/main"
+            let opt: string = if release then " -o:aggressive" else ""
+            let cmd: string = "odin build " + member_dir + "/src -out:" + out + opt
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "zig" => is
+            let opt: string = if release then " -Doptimize=ReleaseFast" else ""
+            ok = ui::run_streaming("cd " + member_dir + " && zig build" + opt, spin) == 0
+        end
+        "crystal" => is
+            let out: string = member_dir + "/build/main"
+            let opt: string = if release then " --release" else ""
+            let cmd: string = "crystal build " + member_dir + "/src/main.cr -o " + out + opt
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "go" | "golang" => is
+            let out: string = member_dir + "/build/main"
+            let cmd: string = "go build -o " + out + " " + member_dir + "/..."
+            ok  = ui::run_streaming(cmd, spin) == 0
+            bin = out
+        end
+        "python" | "py" => is
+            ok = ui::run_streaming("python3 -m py_compile " + member_dir + "/src/main.py", spin) == 0
+        end
+        _ => is
+            ok = false
+        end
+    end
+
+    return ui::MemberOutcome { name: name, lang: lang, success: ok, elapsed: time_ms() - t0, bin_path: bin }
+end
+
+fn collect_into_shared_build(root: string, outcome: ui::MemberOutcome) is
+    let bin: string = ui::outcome_bin(outcome)
+    if !ui::outcome_ok(outcome) || bin == "" || !file_exists(bin) is return end
+    let build_dir: string = if root != "" then root + "/build" else "build"
+    if !dir_exists(build_dir) is dir_create(build_dir) end
+    let dest: string = build_dir + "/" + basename(bin)
+    system("cp -f " + shquote(bin) + " " + shquote(dest))
+end
+
+;; ── One named member only ────────────────────────────────────────────────────
+
+pub fn build_one_member(m: manifest::Manifest, member: string, release: bool, verbose: bool) -> int is
+    let root: string = env_get("VIRA_WORKSPACE_ROOT")
+    if root != "" is system("cd " + root) end
+
+    let members: [string] = manifest::ws_members(m)
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < array_len(members) is
+        if string_trim(members[i]) == member is found = true end
+        i += 1
+    end
+
+    if !found is
+        write("  \x1b[31merror:\x1b[0m no workspace member named '" + member + "'")
+        write("  \x1b[2mAvailable members:\x1b[0m")
+        i = 0
+        while i < array_len(members) is
+            write("    - " + members[i])
+            i += 1
+        end
+        return 1
+    end
+
+    let lang: string = manifest::ws_member_lang(m, member)
+    let tc: Toolchain = probe_toolchain(lang)
+    if !tc.present is
+        write("  \x1b[31merror:\x1b[0m " + lang + " toolchain not found for member '" + member + "' — " + tc.hint)
+        return 1
+    end
+
+    ui::print_build_banner(manifest::ws_name(m) + "::" + member, manifest::ws_version(m), release)
+
+    let t0: int = time_ms()
+    let res: ui::MemberOutcome = build_member(member, lang, release, verbose)
+    ui::print_member_line(res)
+    collect_into_shared_build(root, res)
+
+    let elapsed: int = time_ms() - t0
+    let ok: bool = ui::outcome_ok(res)
+    ui::print_build_summary(if ok then 1 else 0, if ok then 0 else 1, elapsed)
+
+    return if ok then 0 else 1
+end
+
+;; ── Whole workspace ───────────────────────────────────────────────────────────
+
+pub fn build_all_members(m: manifest::Manifest, release: bool, verbose: bool) -> int is
+    let root: string = env_get("VIRA_WORKSPACE_ROOT")
+    if root != "" is system("cd " + root) end
+
+    let declared: [string] = manifest::ws_members(m)
+    let raw_order: string = manifest::ws_build_order(m)
+
+    let order: [string] = if raw_order != "" is
+        let flat: string = string_replace(string_replace(string_replace(raw_order, "[", ""), "]", ""), "\"", "")
+        let parts: [string] = string_split(flat, ",")
+        let mut out: [string] = []
+        let mut pi: int = 0
+        while pi < array_len(parts) is
+            let name: string = string_trim(parts[pi])
+            if name != "" is out = array_push(out, name) end
+            pi += 1
+        end
+        out
+    else is
+        declared
+    end
+
+    let total: int = array_len(order)
+
+    ;; Preflight every distinct language once.
+    let mut missing: [string] = []
+    let mut seen: [string] = []
+    let mut i: int = 0
+    while i < total is
+        let member: string = string_trim(order[i])
+        let lang: string = manifest::ws_member_lang(m, member)
+        let mut already: bool = false
+        let mut si: int = 0
+        while si < array_len(seen) is
+            if seen[si] == lang is already = true end
+            si += 1
+        end
+        if !already is
+            let tc: Toolchain = probe_toolchain(lang)
+            if !tc.present is
+                write("  \x1b[33mwarn:\x1b[0m " + lang + " toolchain not found — " + tc.hint)
+                missing = array_push(missing, lang)
+            end
+            seen = array_push(seen, lang)
+        end
+        i += 1
+    end
+
+    ui::print_build_banner(manifest::ws_name(m), manifest::ws_version(m), release)
+    write("  \x1b[2m── Workspace build (" + to_string(total) + " member(s)) ───────────────────\x1b[0m")
+    write("")
+
+    let t0: int = time_ms()
+    let mut passed: int = 0
+    let mut failed: int = 0
+    let mut bar: ui::Bar = ui::bar_new(total, "default", "workspace")
+    ui::bar_redraw(bar)
+    i = 0
+
+    while i < total is
+        let member: string = string_trim(order[i])
+        if member == "" is i += 1 continue end
+
+        let lang: string = manifest::ws_member_lang(m, member)
+        let mut skip: bool = false
+        let mut mi: int = 0
+        while mi < array_len(missing) is
+            if missing[mi] == lang is skip = true end
+            mi += 1
+        end
+
+        if skip is
+            ui::bar_erase()
+            write("  \x1b[33m-\x1b[0m " + string_pad_right(member, 20) + " \x1b[2mskipped (no toolchain)\x1b[0m")
+            bar = ui::bar_advance(bar, 1)
+            i += 1
+            continue
+        end
+
+        ui::bar_erase()
+        let res: ui::MemberOutcome = build_member(member, lang, release, verbose)
+        ui::print_member_line(res)
+        bar = ui::bar_advance(bar, 1)
+
+        if ui::outcome_ok(res) is passed += 1 else failed += 1 end
+        collect_into_shared_build(root, res)
+        i += 1
+    end
+
+    ui::bar_erase()
+    ui::print_build_summary(passed, failed, time_ms() - t0)
+
+    return if failed == 0 then 0 else 1
+end
