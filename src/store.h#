@@ -1,0 +1,164 @@
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+;; ── Base paths ───────────────────────────────────────────────────────────────
+
+pub fn store_root() -> string is
+    let home: string = env_get("HOME")
+    if home == "" is return "/tmp/.hsharp/bytes-io" end
+    return home + "/.hsharp/bytes-io"
+end
+
+pub fn packages_root() -> string is
+    return store_root() + "/packages"
+end
+
+pub fn pyenv_root() -> string is
+    return store_root() + "/pyenv"
+end
+
+pub fn ensure_store() is
+    if !dir_exists(store_root())    is dir_create(store_root())    end
+    if !dir_exists(packages_root()) is dir_create(packages_root()) end
+    if !dir_exists(pyenv_root())    is dir_create(pyenv_root())    end
+end
+
+;; ── Deterministic slot fingerprinting ────────────────────────────────────────
+;;
+;; A small FNV-1a-shaped rolling hash over the source string, rendered
+;; as 8 lowercase hex digits. Doesn't need to be cryptographic — only
+;; stable across runs (so the same source always reuses the same
+;; directory) and short enough to keep directory names readable. Built
+;; from `str_to_char_code`/plain arithmetic rather than reaching for one
+;; of std's `crypto_*` hashes, since this module has no other reason to
+;; pull in the crypto runtime just to name a folder.
+fn hex_digit(n: int) -> string is
+    let table: string = "0123456789abcdef"
+    return string_slice(table, n, n + 1)
+end
+
+fn to_hex8(n: int) -> string is
+    ;; `n` may come out of the rolling hash as a large positive int;
+    ;; render its low 32 bits, 4 bits (one hex digit) at a time, most
+    ;; significant nibble first.
+    let mut v: int = n
+    if v < 0 is v = -v end
+    let mut out: string = ""
+    let mut shift: int = 28
+    while shift >= 0 is
+        let nibble: int = (v / pow_2(shift)) % 16
+        out = out + hex_digit(nibble)
+        shift -= 4
+    end
+    return out
+end
+
+fn pow_2(bits: int) -> int is
+    let mut r: int = 1
+    let mut i: int = 0
+    while i < bits is
+        r = r * 2
+        i += 1
+    end
+    return r
+end
+
+pub fn fingerprint(source: string) -> string is
+    let mut h: int = 84696351   ;; FNV-ish offset basis, kept small enough for int arithmetic
+    let n: int = string_len(source)
+    let mut i: int = 0
+    while i < n is
+        let code: int = str_to_char_code(string_slice(source, i, i + 1))
+        h = (h * 16777619) % 2147483647
+        h = (h + code) % 2147483647
+        i += 1
+    end
+    return to_hex8(h)
+end
+
+;; ── Dependency slots ─────────────────────────────────────────────────────────
+;;
+;; `kind`/`source` are the same classification `manifest::classify_dep`
+;; already produced for this dependency line — passed straight through
+;; here so the slot key reflects what will actually be fetched:
+;;   "git"/"version"/"newest"  -> fingerprint of the resolved git URL
+;;                                 (or "name@newest" for a `newest` dep,
+;;                                 which always tracks HEAD rather than
+;;                                 one fixed ref)
+;;   "path"                    -> fingerprint of the resolved absolute
+;;                                 directory it points at
+;;   "vira" (plain registry)   -> fingerprint of just the name, since a
+;;                                 plain lookup has no other source text
+;;   "dynamic"/"static"        -> never slotted; these never fetch
+;;                                 anything (see fetcher.h#)
+pub fn dep_slot(name: string, kind: string, source_key: string) -> string is
+    let tag: string = fingerprint(source_key)
+    return packages_root() + "/" + name + "-" + tag
+end
+
+pub fn slot_exists(slot: string) -> bool is
+    return dir_exists(slot) || file_exists(slot)
+end
+
+;; ── Housekeeping ─────────────────────────────────────────────────────────────
+
+pub fn store_size_report() -> string is
+    return store_root()
+end
+
+pub fn wipe_packages() is
+    if dir_exists(packages_root()) is
+        dir_remove_all(packages_root())
+        dir_create(packages_root())
+    end
+end
+
+pub fn wipe_pyenv() is
+    if dir_exists(pyenv_root()) is
+        dir_remove_all(pyenv_root())
+        dir_create(pyenv_root())
+    end
+end
+
+;; ── Sandboxed system-package staging area ───────────────────────────────────
+;; EXPANSION carried over in spirit from bytes' own isolation.h# (its
+;; `IsolatedEnv`/session-dir idea for staging a `.deb`'s contents without
+;; touching the real system) — kept here, off the global store rather
+;; than under a project's `build/`, for the same reason every other
+;; fetched artifact moved: a session's staged files are inputs to a
+;; build, not build output, so they don't belong under any one
+;; project's `build/` tree either.
+pub struct Sandbox is
+    pub root: string
+end
+
+fn try_tmpfs(path: string) -> bool is
+    let rc1: int = system("mount -t tmpfs -o size=512m,mode=0700 tmpfs " + path + " 2>/dev/null")
+    if rc1 == 0 is return true end
+    let rc2: int = system("unshare --user --mount mount -t tmpfs -o size=512m tmpfs " + path + " 2>/dev/null")
+    return rc2 == 0
+end
+
+pub fn sandbox_open() -> Sandbox is
+    let root: string = store_root() + "/sandbox-" + to_string(proc_id())
+    system("mkdir -p '" + root + "'")
+    if !try_tmpfs(root) is
+        file_write(root + "/.vira-sandbox", to_string(proc_id()))
+    end
+    return Sandbox { root: root }
+end
+
+pub fn sandbox_stage_system_pkg(sb: Sandbox, deb_name: string) -> bool is
+    let dest: string = sb.root + "/" + deb_name
+    system("mkdir -p '" + dest + "'")
+    write("  \x1b[2mfetching system package " + deb_name + " → sandbox\x1b[0m")
+    let rc: int = system("apt-get download '" + deb_name + "' 2>/dev/null && " +
+        "dpkg-deb -x " + deb_name + "_*.deb '" + dest + "' 2>/dev/null")
+    return rc == 0
+end
+
+pub fn sandbox_close(sb: Sandbox) is
+    system("umount '" + sb.root + "' 2>/dev/null || true")
+    dir_remove_all(sb.root)
+end
