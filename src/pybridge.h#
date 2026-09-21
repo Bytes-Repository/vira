@@ -1,0 +1,82 @@
+mod store
+
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+pub struct PyEnv is
+    pub version:  string
+    pub venv_dir: string
+end
+
+fn find_python(version: string) -> string is
+    let candidates: [string] = [
+        "python" + version,
+        "python" + string_slice(version, 0, 1),
+        "python3",
+        "python",
+    ]
+    for py in candidates is
+        if system("command -v " + py + " >/dev/null 2>&1") == 0 is return py end
+    end
+    for p in ["/usr/bin/python3", "/usr/local/bin/python3"] is
+        if file_exists(p) is return p end
+    end
+    return "python3"
+end
+
+pub fn open_env(version: string) -> PyEnv is
+    store::ensure_store()
+    let venv_dir: string = store::pyenv_root() + "/venv"
+    if !dir_exists(venv_dir) is
+        let py: string = find_python(version)
+        let rc: int = system(py + " -m venv " + venv_dir + " 2>/dev/null")
+        if rc != 0 is
+            write("  \x1b[33mwarn:\x1b[0m failed to create the shared venv at " + venv_dir)
+        end
+    end
+    return PyEnv { version: version, venv_dir: venv_dir }
+end
+
+pub fn install_one(env: PyEnv, pkg: string, ver: string) -> bool is
+    let pip:  string = env.venv_dir + "/bin/pip"
+    let spec: string = if ver != "" && ver != "latest" then pkg + "==" + ver else pkg
+
+    let pip_bin: string = if file_exists(pip) then pip else "pip3"
+    let rc: int = system(pip_bin + " install -q '" + spec + "' 2>/dev/null")
+    if rc != 0 is
+        let rc2: int = system("pip3 install -q --user '" + spec + "' 2>/dev/null")
+        return rc2 == 0
+    end
+    return true
+end
+
+pub fn install_many(pkgs: [string], count: int, version: string) -> bool is
+    if count == 0 is return true end
+
+    let env: PyEnv = open_env(version)
+    write("  \x1b[2mInstalling " + to_string(count) + " Python package(s) → " + store::pyenv_root() + "\x1b[0m")
+
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < count is
+        let pkg: string = pkgs[i]
+        if !install_one(env, pkg, "") is
+            write("  \x1b[33mwarn:\x1b[0m failed to install Python package: " + pkg)
+            failed += 1
+        else is
+            write("  \x1b[32m✓\x1b[0m  " + pkg)
+        end
+        i += 1
+    end
+
+    return failed == 0
+end
+
+pub fn locate_import(pkg: string, venv_dir: string) -> string is
+    let tmp: string = "/tmp/vira_py_find_" + to_string(proc_id()) + ".txt"
+    system("find " + venv_dir + "/lib -name '" + pkg + "' -maxdepth 4 2>/dev/null | head -1 > " + tmp)
+    let hit: string = string_trim(file_read(tmp))
+    file_delete(tmp)
+    return hit
+end
