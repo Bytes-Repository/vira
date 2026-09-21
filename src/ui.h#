@@ -1,0 +1,320 @@
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+mod prefs
+
+;; ── Bar themes ───────────────────────────────────────────────────────────────
+;; Each theme is just an open/close bracket, a fill glyph, an empty
+;; glyph, and an optional arrowhead swapped in for the leading fill
+;; character. Adding a theme is a one-line change per table below.
+
+pub fn theme_names() -> [string] is
+    return ["default", "arrow", "dotted", "cargo", "equals", "blocks"]
+end
+
+fn glyph_open(theme: string) -> string is
+    return match theme is
+        "arrow" | "cargo" | "blocks" => "["
+        _                            => "<"
+    end
+end
+
+fn glyph_close(theme: string) -> string is
+    return match theme is
+        "arrow" | "cargo" | "blocks" => "]"
+        _                            => ">"
+    end
+end
+
+fn glyph_fill(theme: string) -> string is
+    return match theme is
+        "arrow"  => "-"
+        "cargo"  => "="
+        "dotted" => "-"
+        "equals" => "="
+        "blocks" => "█"
+        _        => "#"
+    end
+end
+
+fn glyph_empty(theme: string) -> string is
+    return match theme is
+        "arrow"  => " "
+        "cargo"  => " "
+        "dotted" => "."
+        "equals" => "-"
+        "blocks" => "░"
+        _        => "-"
+    end
+end
+
+fn glyph_head(theme: string) -> string is
+    return match theme is
+        "arrow" | "cargo" => ">"
+        _                 => ""
+    end
+end
+
+fn resolve_theme(requested: string) -> string is
+    if requested == "default" is return prefs::get("bar_theme", "default") end
+    return requested
+end
+
+pub fn theme_preview(theme: string) -> string is
+    let width: int = 16
+    let filled: int = (width * 4) / 10
+    let empty: int = width - filled
+    let head: string = glyph_head(theme)
+
+    let mut bar: string = ""
+    if head != "" && filled > 0 is
+        bar = string_repeat(glyph_fill(theme), filled - 1) + head
+    else is
+        bar = string_repeat(glyph_fill(theme), filled)
+    end
+
+    return glyph_open(theme) + bar + string_repeat(glyph_empty(theme), empty) + glyph_close(theme)
+end
+
+;; ── Single-line progress bar ─────────────────────────────────────────────────
+
+pub struct Bar is
+    pub total:      int
+    pub current:    int
+    pub width:      int
+    pub theme:      string
+    pub label:      string
+    pub started_at: int
+end
+
+pub fn bar_new(total: int, theme: string, label: string) -> Bar is
+    return Bar { total: total, current: 0, width: 20, theme: resolve_theme(theme), label: label, started_at: time_ms() }
+end
+
+fn render_track(b: Bar, filled: int, empty: int) -> string is
+    let head: string = glyph_head(b.theme)
+    let mut bar: string = ""
+    if head != "" && filled > 0 is
+        bar = string_repeat(glyph_fill(b.theme), filled - 1) + head
+    else is
+        bar = string_repeat(glyph_fill(b.theme), filled)
+    end
+
+    return "\x1b[36m" + glyph_open(b.theme) + "\x1b[0m\x1b[36m\x1b[1m" + bar + "\x1b[0m\x1b[2m" +
+           string_repeat(glyph_empty(b.theme), empty) + "\x1b[0m\x1b[36m" + glyph_close(b.theme) + "\x1b[0m"
+end
+
+fn render_line(b: Bar) -> string is
+    let pct:    int = if b.total > 0 then (b.current * 100) / b.total else 100
+    let filled: int = if b.total > 0 then (b.current * b.width) / b.total else b.width
+    let empty:  int = b.width - filled
+
+    let track:   string = render_track(b, filled, empty)
+    let pct_str: string = "\x1b[33m\x1b[1m" + to_string(pct) + "%\x1b[0m"
+
+    let mut eta: string = ""
+    if pct > 0 && pct < 100 is
+        let elapsed:  int = time_ms() - b.started_at
+        let per_item: int = if b.current > 0 then elapsed / b.current else 0
+        let left:     int = b.total - b.current
+        let secs:     int = (per_item * left) / 1000
+        eta = "\x1b[2m ~" + to_string(secs) + "s\x1b[0m"
+    end
+
+    return track + " " + pct_str + " " + eta + string_repeat(" ", 10) +
+           "  \x1b[36m" + b.label + "\x1b[0m"
+end
+
+pub fn bar_advance(b: Bar, n: int) -> Bar is
+    let clamped: int = if b.current + n > b.total then b.total else b.current + n
+    let next: Bar = Bar { total: b.total, current: clamped, width: b.width, theme: b.theme, label: b.label, started_at: b.started_at }
+    io_print("\r" + render_line(next))
+    return next
+end
+
+pub fn bar_redraw(b: Bar) is
+    io_print("\r" + render_line(b))
+end
+
+pub fn bar_erase() is
+    io_print("\r" + string_repeat(" ", 100) + "\r")
+end
+
+pub fn bar_finish(b: Bar, msg: string) is
+    let done: Bar = Bar { total: b.total, current: b.total, width: b.width, theme: b.theme, label: b.label, started_at: b.started_at }
+    io_print("\r" + render_line(done))
+    write("")
+    write("  \x1b[32m\x1b[1m✓\x1b[0m \x1b[1m" + msg + "\x1b[0m")
+end
+
+;; ── Pinned three-row status block (used while fetching dependencies) ────────
+;; Row 1: "Fetching <label>"; row 2: the bar; row 3: "└ <current step>".
+;; All three redraw in place each tick, the same "erase, print a real
+;; permanent line, repaint underneath it" trick every terminal progress
+;; UI without a real scroll-region relies on — a plain `write()` next to
+;; a `\r`-only redraw would otherwise seal a brand new copy of the bar
+;; as its own permanent line the moment anything else gets logged.
+pub struct StatusBlock is
+    pub bar:    Bar
+    pub phase:  string
+    pub step:   string
+    pub shown:  bool
+end
+
+pub fn block_new(total: int, theme: string, label: string, phase: string) -> StatusBlock is
+    return StatusBlock { bar: bar_new(total, theme, label), phase: phase, step: "…", shown: false }
+end
+
+fn block_row1(s: StatusBlock) -> string is return "  \x1b[1m" + s.phase + "\x1b[0m \x1b[36m" + s.bar.label + "\x1b[0m" end
+fn block_row2(s: StatusBlock) -> string is return "  " + render_line(s.bar) end
+fn block_row3(s: StatusBlock) -> string is return "  \x1b[2m└ " + s.step + "\x1b[0m" end
+
+fn block_paint(s: StatusBlock) is
+    io_print("\r\x1b[0K" + block_row1(s) + "\n")
+    io_print("\r\x1b[0K" + block_row2(s) + "\n")
+    io_print("\r\x1b[0K" + block_row3(s))
+end
+
+pub fn block_draw(s: StatusBlock) -> StatusBlock is
+    if s.shown is io_print("\x1b[2A") end
+    block_paint(s)
+    return StatusBlock { bar: s.bar, phase: s.phase, step: s.step, shown: true }
+end
+
+pub fn block_advance(s: StatusBlock, n: int) -> StatusBlock is
+    let clamped: int = if s.bar.current + n > s.bar.total then s.bar.total else s.bar.current + n
+    let bar: Bar = Bar { total: s.bar.total, current: clamped, width: s.bar.width, theme: s.bar.theme, label: s.bar.label, started_at: s.bar.started_at }
+    return block_draw(StatusBlock { bar: bar, phase: s.phase, step: s.step, shown: s.shown })
+end
+
+pub fn block_step(s: StatusBlock, step: string) -> StatusBlock is
+    return block_draw(StatusBlock { bar: s.bar, phase: s.phase, step: step, shown: s.shown })
+end
+
+pub fn block_note(s: StatusBlock, line: string) is
+    if s.shown is
+        io_print("\x1b[2A\r\x1b[0K\n\x1b[0K\n\x1b[0K\x1b[2A")
+    end
+    write(line)
+    block_paint(s)
+end
+
+pub fn block_finish(s: StatusBlock, msg: string) is
+    if s.shown is
+        io_print("\x1b[2A\r\x1b[0K\n\x1b[0K\n\x1b[0K\x1b[2A")
+    end
+    write("  \x1b[32m\x1b[1m✓\x1b[0m \x1b[1m" + msg + "\x1b[0m")
+end
+
+;; ── Timing ───────────────────────────────────────────────────────────────────
+
+pub fn elapsed_str(ms: int) -> string is
+    if ms < 1000 is return to_string(ms) + "ms" end
+    let secs: int  = ms / 1000
+    let tenths: int = (ms % 1000) / 100
+    return to_string(secs) + "." + to_string(tenths) + "s"
+end
+
+;; ── Build summaries ──────────────────────────────────────────────────────────
+
+pub struct MemberOutcome is
+    pub name:     string
+    pub lang:     string
+    pub success:  bool
+    pub elapsed:  int
+    ;; Resolved path to whatever binary/library this member produced,
+    ;; or "" when the language branch has no single well-known output
+    ;; to report (cargo/zig nest their own target dirs; a python member
+    ;; is only syntax-checked). Used to also collect a copy into the
+    ;; workspace root's shared build/ dir.
+    pub bin_path: string
+end
+
+pub fn outcome_ok(o: MemberOutcome)   -> bool   is return o.success  end
+pub fn outcome_bin(o: MemberOutcome)  -> string is return o.bin_path end
+
+pub fn print_member_line(o: MemberOutcome) is
+    let icon: string = if o.success then "\x1b[32m✓\x1b[0m" else "\x1b[31mx\x1b[0m"
+    write("  " + icon + " " + string_pad_right(o.name, 20) + " \x1b[2m" + o.lang + " (" + elapsed_str(o.elapsed) + ")\x1b[0m")
+end
+
+pub fn print_build_banner(name: string, version: string, release: bool) is
+    write("")
+    write("  \x1b[1mvira\x1b[0m  \x1b[2mCompiling\x1b[0m \x1b[1m" + name + "\x1b[0m v" + version +
+          if release then " \x1b[33m(release)\x1b[0m" else "")
+    write("")
+end
+
+pub fn print_build_summary(passed: int, failed: int, elapsed_ms: int) is
+    write("")
+    write("  \x1b[2m──────────────────────────────────────────────────\x1b[0m")
+    if failed == 0 is
+        write("  \x1b[32m✓\x1b[0m  " + to_string(passed) + "/" + to_string(passed + failed) +
+              " succeeded  \x1b[2m(" + elapsed_str(elapsed_ms) + ")\x1b[0m")
+    else is
+        write("  \x1b[31mx\x1b[0m  " + to_string(passed) + "/" + to_string(passed + failed) +
+              " succeeded, " + to_string(failed) + " failed  \x1b[2m(" + elapsed_str(elapsed_ms) + ")\x1b[0m")
+    end
+    write("")
+end
+
+;; ── Run a shell command, streaming its own stdout/stderr live ───────────────
+;; The child inherits vira's own stdio directly instead of anything
+;; trying to capture it — a compiler error block should look exactly
+;; like it would if the person had typed the compiler command
+;; themselves. Only the exit code is round-tripped, via a one-line
+;; `echo $? > file` after the command.
+pub fn run_streaming(cmd: string, label: string) -> int is
+    write("  \x1b[2m" + label + " …\x1b[0m")
+    let marker: string = "/tmp/vira_status_" + to_string(proc_id()) + "_" + to_string(time_ms()) + ".txt"
+    system(cmd + "; echo $? > " + marker)
+    let code: int = if file_exists(marker) then read_exit_code(marker) else 1
+    if file_exists(marker) is file_delete(marker) end
+    return code
+end
+
+fn read_exit_code(path: string) -> int is
+    let t: string = string_trim(file_read(path))
+    let n: int = string_len(t)
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(t, i)
+        if c >= "0" && c <= "9" is
+            result = result * 10 + (str_to_char_code(c) - str_to_char_code("0"))
+        end
+        i += 1
+    end
+    return result
+end
+
+;; Same idea, but also captures combined output for callers that need
+;; to show a handful of error lines afterward (a single project build,
+;; rather than a live-streamed workspace member).
+pub fn run_captured(cmd: string) -> (string, int) is
+    let tmp: string = "/tmp/vira_capture_" + to_string(proc_id()) + "_" + to_string(time_ms()) + ".txt"
+    system("{ " + cmd + "; echo \"__VIRA_EXIT__:$?\"; } >" + tmp + " 2>&1")
+    let raw: string = file_read(tmp)
+    file_delete(tmp)
+    let marker: string = "__VIRA_EXIT__:"
+    let idx: int = string_rfind(raw, marker)
+    if idx < 0 is return (raw, 1) end
+    let out: string  = string_slice(raw, 0, idx)
+    let code_s: string = string_trim(string_slice(raw, idx + string_len(marker), string_len(raw)))
+    return (out, read_exit_code_str(code_s))
+end
+
+fn read_exit_code_str(s: string) -> int is
+    let n: int = string_len(s)
+    let mut result: int = 0
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c >= "0" && c <= "9" is
+            result = result * 10 + (str_to_char_code(c) - str_to_char_code("0"))
+        end
+        i += 1
+    end
+    return result
+end
