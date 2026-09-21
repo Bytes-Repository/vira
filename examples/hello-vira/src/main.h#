@@ -1,0 +1,4 @@
+fn main() is
+    write("Hello from hello-vira!")
+    write("Built the same way whether you run 'bytes build' or 'vira build'.")
+end
