@@ -1,0 +1,434 @@
+pub struct PackageInfo is
+    pub name:        string
+    pub version:     string
+    pub description: string
+    pub entry:       string
+    pub author:      string
+    pub license:     string
+end
+
+pub struct BuildInfo is
+    pub lang:        string
+    pub entry:       string
+    pub output:      string
+    pub emit:        string
+    pub flags:       string
+    pub parallel:    bool
+    pub cache_dir:   string
+    pub build_order: string
+    ;; Extra `mod X` search directory, forwarded to `h# compile` as
+    ;; `-I <dir>` — same meaning and same key (`-> include => ...`) a
+    ;; `bytes.hk`/`Bytes.hk` project already uses.
+    pub include:     string
+    ;; Project-wide default `MemoryMode`, forwarded as `--mem-mode`;
+    ;; still overridden per-file by a `@: mode` first line and per-fn by
+    ;; a `@mode` annotation, exactly like it is for `bytes`.
+    pub mem_mode:    string
+end
+
+pub struct DependencyLine is
+    pub name:   string
+    pub kind:   string
+    pub source: string
+end
+
+pub struct WorkspaceInfo is
+    pub name:        string
+    pub version:     string
+    pub mode:        string
+    pub members:     string
+    pub languages:   string
+    pub build_order: string
+end
+
+pub struct Manifest is
+    pub package:      PackageInfo
+    pub build:        BuildInfo
+    pub workspace:    WorkspaceInfo
+    pub deps:         [DependencyLine]
+    pub deps_count:   int
+    pub is_workspace: bool
+    pub base_dir:     string
+    ;; Collected during `parse_text` for a malformed `[deps]` line (e.g.
+    ;; a bare `-> lib => git` naming no repository at all). Held here
+    ;; instead of failing inside `parse_text` so parsing stays pure;
+    ;; `load`/`load_from` turn a non-empty list into a real error + exit.
+    pub problems:      [string]
+end
+
+pub fn blank_manifest() -> Manifest is
+    return Manifest {
+        package: PackageInfo {
+            name: "unnamed", version: "0.1.0", description: "",
+            entry: "src/main.h#", author: "", license: "MIT"
+        },
+        build: BuildInfo {
+            lang: "h#", entry: "src/main.h#", output: "build/main",
+            emit: "bin", flags: "", parallel: false,
+            cache_dir: "build/cache", build_order: "",
+            include: "", mem_mode: ""
+        },
+        workspace: WorkspaceInfo {
+            name: "", version: "", mode: "standard",
+            members: "", languages: "", build_order: ""
+        },
+        deps: [], deps_count: 0,
+        is_workspace: false, base_dir: ".",
+        problems: [],
+    }
+end
+
+;; ── Same-module accessors (see the top-of-file note) ────────────────────────
+
+pub fn deps_len(m: Manifest) -> int is return m.deps_count end
+pub fn dep_at(m: Manifest, i: int) -> DependencyLine is return m.deps[i] end
+pub fn dep_name(d: DependencyLine)   -> string is return d.name   end
+pub fn dep_kind(d: DependencyLine)   -> string is return d.kind   end
+pub fn dep_source(d: DependencyLine) -> string is return d.source end
+
+pub fn ws_name(m: Manifest)        -> string is return m.workspace.name        end
+pub fn ws_version(m: Manifest)     -> string is return m.workspace.version     end
+pub fn ws_mode(m: Manifest)        -> string is return m.workspace.mode        end
+pub fn ws_build_order(m: Manifest) -> string is return m.workspace.build_order end
+
+pub fn build_cache_dir(m: Manifest) -> string is
+    if m.build.cache_dir != "" is return m.build.cache_dir end
+    return "build/cache"
+end
+
+pub fn pkg_name(m: Manifest)    -> string is return m.package.name    end
+pub fn pkg_version(m: Manifest) -> string is return m.package.version end
+
+pub fn build_entry(m: Manifest) -> string is
+    if m.build.entry   != "" is return m.build.entry   end
+    if m.package.entry != "" is return m.package.entry end
+    return "src/main.h#"
+end
+
+pub fn build_output(m: Manifest) -> string is
+    if m.build.output != "" is return m.build.output end
+    return "build/" + m.package.name
+end
+
+pub fn build_lang(m: Manifest) -> string is
+    if m.build.lang != "" is return m.build.lang end
+    return "h#"
+end
+
+pub fn ws_members(m: Manifest) -> [string] is
+    let flat: string = string_replace(string_replace(
+        string_replace(m.workspace.members, "[", ""), "]", ""), "\"", "")
+    let parts: [string] = string_split(flat, ",")
+    let n: int = array_len(parts)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < n is
+        let name: string = string_trim(parts[i])
+        if name != "" is out = array_push(out, name) end
+        i += 1
+    end
+    return out
+end
+
+pub fn ws_member_lang(m: Manifest, member: string) -> string is
+    let pairs: [string] = string_split(m.workspace.languages, ",")
+    let n: int = array_len(pairs)
+    let mut i: int = 0
+    while i < n is
+        let pair: string = string_trim(pairs[i])
+        let eq: int = string_find(pair, "=")
+        if eq > 0 is
+            let key: string = string_trim(string_slice(pair, 0, eq))
+            let val: string = string_trim(string_slice(pair, eq + 1, string_len(pair)))
+            if key == member is return val end
+        end
+        i += 1
+    end
+    return "h#"
+end
+
+;; ── Line-level helpers ───────────────────────────────────────────────────────
+
+fn squeeze(s: string) -> string is return string_trim(s) end
+
+pub fn value_of(line: string) -> string is
+    let arrow: int = string_find(line, "=>")
+    if arrow < 0 is return "" end
+    let raw: string = squeeze(string_slice(line, arrow + 2, string_len(line)))
+    let raw: string = string_replace(raw, "\"", "")
+    ;; Strip a trailing inline comment ("  !" or "  ;;"), whichever
+    ;; appears first.
+    let bang: int = string_find(raw, "  !")
+    let semi: int = string_find(raw, "  ;;")
+    let cut: int = if bang >= 0 && (semi < 0 || bang < semi) then bang
+                   else if semi >= 0 then semi
+                   else -1
+    return if cut >= 0 then squeeze(string_slice(raw, 0, cut)) else raw
+end
+
+pub fn key_of(line: string) -> string is
+    let t: string = squeeze(line)
+    let mut i: int = 0
+    while i < string_len(t) && string_at(t, i) == "-" is i += 1 end
+    if i < string_len(t) && string_at(t, i) == ">" is i += 1 end
+    let t: string = squeeze(string_slice(t, i, string_len(t)))
+    let arrow: int = string_find(t, "=>")
+    if arrow < 0 is return squeeze(t) end
+    return squeeze(string_slice(t, 0, arrow))
+end
+
+;; ── [deps] value classification ──────────────────────────────────────────────
+;;
+;; A `-> name => <value>` line's `<value>` classifies exactly the way it
+;; does for `bytes` — this is part of the shared manifest dialect, not
+;; something vira changes:
+;;   "dynamic" / "static"        -> link a system library, nothing fetched
+;;   a real git/http(s) URL      -> "git": clone it
+;;   "vX[.Y[.Z]]"                -> "version": pin to that published tag
+;;   "newest" (any case)         -> "newest": always track latest from source
+;;   a local directory           -> "path": link, never fetched/cached
+;;   anything else / empty       -> "vira": plain registry lookup by name
+;;   the bare word "git" alone   -> rejected up front, names no repository
+
+fn is_bare_git_word(v: string) -> bool is
+    return string_lower(squeeze(v)) == "git"
+end
+
+fn is_newest_word(v: string) -> bool is
+    return string_lower(squeeze(v)) == "newest"
+end
+
+fn is_version_pin(v: string) -> bool is
+    let t: string = squeeze(v)
+    if string_len(t) < 2 || string_at(t, 0) != "v" is return false end
+    let c: string = string_at(t, 1)
+    return c >= "0" && c <= "9"
+end
+
+;; `-> name => path:<dir>`, or a bare `./dir` / `../dir` / `/abs/dir` —
+;; a sibling package that already lives on disk (see fetcher.h#'s
+;; `install_path_dep`). Checked after git/http/version/newest, so a
+;; real URL is never mistaken for one.
+fn is_path_spec(v: string) -> bool is
+    return string_starts_with(v, "path:") || string_starts_with(v, "./") ||
+           string_starts_with(v, "../")   || string_starts_with(v, "/")
+end
+
+fn classify_dep(v: string) -> string is
+    if v == "dynamic" || v == "static" is return v end
+    if is_newest_word(v)   is return "newest"  end
+    if is_version_pin(v)   is return "version" end
+    if string_starts_with(v, "git")  is return "git"  end
+    if string_starts_with(v, "http") is return "git"  end
+    if is_path_spec(v)               is return "path" end
+    return "vira"
+end
+
+;; Strips a `path:` prefix when present, so fetcher.h# always receives
+;; a plain directory string regardless of which spelling was used.
+pub fn path_source(v: string) -> string is
+    if string_starts_with(v, "path:") is return string_slice(v, 5, string_len(v)) end
+    return v
+end
+
+;; ── Parsing ──────────────────────────────────────────────────────────────────
+
+pub fn parse_text(content: string) -> Manifest is
+    let mut m: Manifest = blank_manifest()
+    let mut section: string = ""
+    let mut sub:     string = ""
+
+    let lines: [string] = string_split(content, "\n")
+    let total: int = array_len(lines)
+    let mut i: int = 0
+
+    while i < total is
+        let raw: string = squeeze(lines[i])
+        i += 1
+
+        if raw == "" || string_starts_with(raw, "!") ||
+           string_starts_with(raw, ";;") || string_starts_with(raw, "#") is
+            continue
+        end
+
+        if string_starts_with(raw, "[") && string_ends_with(raw, "]") is
+            section = string_slice(raw, 1, string_len(raw) - 1)
+            sub = ""
+            continue
+        end
+
+        if !string_starts_with(raw, "->") is continue end
+
+        let key: string = key_of(raw)
+        let val: string = value_of(raw)
+
+        if val == "" && !string_contains(raw, "=>") is
+            sub = key
+            continue
+        end
+
+        match section is
+            "package" => is
+                match key is
+                    "name"        => is m.package.name        = val end
+                    "version"     => is m.package.version     = val end
+                    "description" => is m.package.description = val end
+                    "entry"       => is m.package.entry       = val end
+                    "author"      => is m.package.author      = val end
+                    "license"     => is m.package.license     = val end
+                    _ => is end
+                end
+            end
+            "build" => is
+                match key is
+                    "lang"        => is m.build.lang        = val end
+                    "entry"       => is m.build.entry       = val end
+                    "output"      => is m.build.output      = val end
+                    "emit"        => is m.build.emit        = val end
+                    "flags"       => is m.build.flags       = val end
+                    "parallel"    => is m.build.parallel    = val == "true" end
+                    "cache"       => is m.build.cache_dir   = val end
+                    "build-order" => is m.build.build_order = val end
+                    "mem-mode"    => is m.build.mem_mode    = val end
+                    "include"     => is m.build.include     = val end
+                    _ => is end
+                end
+            end
+            "workspace" => is
+                m.is_workspace = true
+                if sub == "languages" is
+                    let member: string = squeeze(string_replace(key, "-", ""))
+                    m.workspace.languages = m.workspace.languages + member + "=" + val + ","
+                else is
+                    match key is
+                        "name"        => is m.workspace.name        = val end
+                        "version"     => is m.workspace.version     = val end
+                        "mode"        => is m.workspace.mode        = val end
+                        "members"     => is m.workspace.members     = val end
+                        "build-order" => is m.workspace.build_order = val end
+                        _ => is end
+                    end
+                end
+            end
+            "deps" | "dependencies" => is
+                if is_bare_git_word(val) is
+                    m.problems = array_push(m.problems,
+                        "[deps] '" + key + " => git' names no repository — " +
+                        "use a full URL (e.g. 'https://github.com/owner/" + key +
+                        ".git') or 'git@host:owner/" + key + ".git' instead.")
+                    m.deps       = array_push(m.deps, DependencyLine { name: key, kind: "invalid", source: val })
+                    m.deps_count += 1
+                else is
+                    let kind: string = classify_dep(val)
+                    let source: string = if kind == "path" then path_source(val) else val
+                    m.deps       = array_push(m.deps, DependencyLine { name: key, kind: kind, source: source })
+                    m.deps_count += 1
+                end
+            end
+            _ => is end
+        end
+    end
+
+    if m.package.name == "" is m.package.name = "unnamed" end
+    return m
+end
+
+;; ── File discovery ───────────────────────────────────────────────────────────
+
+pub fn find_manifest() -> string is
+    ;; "Bytes.hk" checked first (canonical spelling), "bytes.hk" and the
+    ;; older ".toml" names still recognised — exactly the same candidate
+    ;; list a `bytes` project already relies on.
+    let names: [string] = ["Bytes.hk", "bytes.hk", "Bytes.toml", "bytes.toml"]
+    for n in names is
+        if file_exists(n) is return n end
+    end
+    return ""
+end
+
+pub fn find_manifest_upward() -> string is
+    let here: string = find_manifest()
+    if here != "" is return here end
+    let mut dir: string = ".."
+    let mut depth: int = 0
+    while depth < 5 is
+        for n in ["Bytes.hk", "bytes.hk"] is
+            let candidate: string = dir + "/" + n
+            if file_exists(candidate) is return candidate end
+        end
+        dir = dir + "/.."
+        depth += 1
+    end
+    return ""
+end
+
+fn fail_if_broken(m: Manifest) is
+    if array_len(m.problems) == 0 is return end
+    let mut i: int = 0
+    while i < array_len(m.problems) is
+        write("  \x1b[31merror:\x1b[0m " + m.problems[i])
+        i += 1
+    end
+    exit(1)
+end
+
+pub fn load() -> Manifest is
+    let path: string = find_manifest()
+    if path == "" is
+        write("  \x1b[31merror:\x1b[0m no Bytes.hk found in this directory")
+        write("  Run 'vira new <name>' to create a project")
+        exit(1)
+    end
+    let mut m: Manifest = parse_text(file_read(path))
+    m.base_dir = "."
+    fail_if_broken(m)
+    return m
+end
+
+pub fn load_from(path: string) -> Manifest is
+    let mut m: Manifest = parse_text(file_read(path))
+    let slash: int = string_rfind(path, "/")
+    m.base_dir = if slash >= 0 then string_slice(path, 0, slash) else "."
+    fail_if_broken(m)
+    return m
+end
+
+;; ── Scaffolding templates ────────────────────────────────────────────────────
+;; Byte-for-byte the same sections/keys `bytes new` writes, so a project
+;; vira scaffolds is just as buildable with `bytes` as one vira itself
+;; created — and vice versa.
+
+pub fn template_binary(name: string) -> string is
+    return "[package]\n-> name        => " + name + "\n" +
+           "-> version     => 0.1.0\n-> description => " + name + "\n" +
+           "-> author      =>\n-> license     => MIT\n\n" +
+           "[build]\n-> lang   => h#\n-> entry  => src/main.h#\n" +
+           "-> output => build/" + name + "\n\n[deps]\n"
+end
+
+pub fn template_workspace(name: string) -> string is
+    return "! " + name + " workspace\n\n[workspace]\n" +
+           "-> name    => " + name + "\n-> version => 0.1.0\n" +
+           "-> mode    => standard\n-> members => [\"" + name + "-core\"]\n\n" +
+           "[build]\n-> parallel => true\n-> cache    => build/cache/\n"
+end
+
+pub fn template_library(name: string) -> string is
+    return "[package]\n-> name    => " + name + "\n-> version => 0.1.0\n\n" +
+           "[build]\n-> lang   => h#\n-> entry  => src/lib.h#\n" +
+           "-> output => build/lib" + name + "\n-> emit   => lib\n"
+end
+
+pub fn template_main_source(name: string) -> string is
+    return ";; " + name + " — main entry point\n\nfn main() is\n" +
+           "    write(\"Hello from " + name + "!\")\nend\n"
+end
+
+pub fn template_lib_source(name: string) -> string is
+    return ";; " + name + " — library\n\npub fn hello() -> string is\n" +
+           "    return \"Hello from " + name + "!\"\nend\n"
+end
+
+pub fn template_gitignore() -> string is
+    return "build/\nbuild/cache/\nvira.lock\n*.jit\n*.h#bc\n"
+end
