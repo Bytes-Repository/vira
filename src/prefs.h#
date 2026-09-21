@@ -1,0 +1,73 @@
+pub fn prefs_dir() -> string is
+    let home: string = env_get("HOME")
+    let base: string = if home == "" then "." else home
+    return base + "/.hackeros/H#"
+end
+
+pub fn prefs_path() -> string is
+    return prefs_dir() + "/vira-settings.hk"
+end
+
+pub fn ensure_prefs_dir() is
+    let d: string = prefs_dir()
+    if !dir_exists(d) is dir_create(d) end
+end
+
+pub fn get(key: string, fallback: string) -> string is
+    let path: string = prefs_path()
+    if !file_exists(path) is return fallback end
+
+    let lines:  [string] = string_split(file_read(path), "\n")
+    let prefix: string   = "-> " + key + " => "
+    let n: int = array_len(lines)
+    let mut i: int = 0
+    while i < n is
+        let line: string = string_trim(lines[i])
+        if string_starts_with(line, prefix) is
+            return string_trim(string_replace(line, prefix, ""))
+        end
+        i += 1
+    end
+    return fallback
+end
+
+pub fn set(key: string, value: string) is
+    ensure_prefs_dir()
+    let path: string = prefs_path()
+    let existing: string = if file_exists(path) then file_read(path) else "[defaults]\n"
+
+    let lines:  [string] = string_split(existing, "\n")
+    let prefix: string   = "-> " + key + " => "
+
+    let mut kept: [string] = []
+    let mut i: int = 0
+    let n: int = array_len(lines)
+    while i < n is
+        let line: string = lines[i]
+        if string_trim(line) != "" && !string_starts_with(string_trim(line), prefix) is
+            kept = array_push(kept, line)
+        end
+        i += 1
+    end
+
+    let mut out: string = ""
+    let mut ki: int = 0
+    while ki < array_len(kept) is
+        out = out + kept[ki] + "\n"
+        ki += 1
+    end
+    out = out + prefix + value + "\n"
+
+    file_write(path, out)
+end
+
+pub fn reset() is
+    let path: string = prefs_path()
+    if file_exists(path) is file_delete(path) end
+end
+
+pub fn dump() -> string is
+    let path: string = prefs_path()
+    if !file_exists(path) is return "" end
+    return file_read(path)
+end
