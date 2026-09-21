@@ -1,0 +1,583 @@
+mod manifest
+mod workspace
+mod ui
+mod fetcher
+mod registry
+mod lockfile
+mod fmt
+mod tester
+mod docs
+mod prefs
+mod pybridge
+mod store
+
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+    fn exit(code: int)
+end
+
+fn find_h_sharp() -> string is
+    let bins: [string] = ["h#", "/usr/bin/h#", "hsharp"]
+    for b in bins is
+        if system("command -v " + b + " >/dev/null 2>&1") == 0 is return b end
+    end
+    return "h#"
+end
+
+;; ── Argument helpers ──────────────────────────────────────────────────────────
+
+pub fn arg_at(args: [string], argc: int, i: int) -> string is
+    if i < argc is return args[i] end
+    return ""
+end
+
+pub fn arg_has(args: [string], argc: int, flag: string) -> bool is
+    let mut i: int = 0
+    while i < argc is
+        if args[i] == flag is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn args_from(args: [string], argc: int, start: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = start
+    while i < argc is
+        out = array_push(out, args[i])
+        i += 1
+    end
+    return out
+end
+
+pub fn args_positional(args: [string], argc: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < argc is
+        if !string_starts_with(args[i], "-") is out = array_push(out, args[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; ── Help ─────────────────────────────────────────────────────────────────────
+
+pub fn print_banner() is
+    write("")
+    write("  \x1b[1mvira\x1b[0m  H# Package Manager")
+    write("  \x1b[2mv1.0.0\x1b[0m  build • run • deps • workspaces")
+    write("")
+end
+
+pub fn print_version() is
+    print_banner()
+end
+
+pub fn print_help() is
+    print_banner()
+    write("  \x1b[1mUsage:\x1b[0m  vira <command> [options]")
+    write("")
+    write("  \x1b[1mProject commands:\x1b[0m")
+    write("    \x1b[36mnew\x1b[0m       <name> [--lib]          create new project")
+    write("    \x1b[36mnew-ws\x1b[0m    <name> [--special]      create workspace")
+    write("    \x1b[36mbuild\x1b[0m     [--release] [-v]        compile project")
+    write("    \x1b[36mrun\x1b[0m       [--release] [-- args]   build and run")
+    write("    \x1b[36mcheck\x1b[0m     [-v]                    type-check only")
+    write("    \x1b[36mclean\x1b[0m     [--everything]          remove build/")
+    write("    \x1b[36mtest\x1b[0m      [filter]                run #[test] blocks")
+    write("    \x1b[36mfmt\x1b[0m       [files...]              format .h# files")
+    write("    \x1b[36mdoc\x1b[0m       [out-dir]               generate HTML docs")
+    write("")
+    write("  \x1b[1mDependency commands:\x1b[0m")
+    write("    \x1b[36madd\x1b[0m       <pkg> [version]         add dependency")
+    write("    \x1b[36mremove\x1b[0m    <pkg>                   remove dependency")
+    write("    \x1b[36minstall\x1b[0m                           install all deps")
+    write("    \x1b[36mupdate\x1b[0m                            update all deps")
+    write("    \x1b[36msearch\x1b[0m    <query>                 search registry")
+    write("    \x1b[36minfo\x1b[0m      <pkg>                   package information")
+    write("    \x1b[36mlist\x1b[0m                              list installed deps")
+    write("    \x1b[36mpython\x1b[0m    <pkg>                   add Python package")
+    write("")
+    write("  \x1b[1mWorkspace:\x1b[0m")
+    write("    \x1b[36mworkspace\x1b[0m | ws   info|build|list  workspace commands")
+    write("")
+    write("  \x1b[1mUtilities:\x1b[0m")
+    write("    \x1b[36mcache\x1b[0m                             cache information")
+    write("    \x1b[36msettings\x1b[0m                          interactive settings menu")
+    write("    \x1b[36mlangs\x1b[0m                             supported languages")
+    write("    \x1b[36m--version\x1b[0m | -V                   show version")
+    write("")
+    write("  \x1b[2mFlags: --release (-r)  --verbose (-v)  --file (-f) <file>\x1b[0m")
+    write("  \x1b[2mLibraries are fetched once into ~/.hsharp/bytes-io/ and shared\x1b[0m")
+    write("  \x1b[2macross every project — build/ only ever holds compiled output.\x1b[0m")
+    write("")
+end
+
+;; ── new / new-workspace ──────────────────────────────────────────────────────
+
+pub fn cmd_new(name: string, is_lib: bool, is_ws: bool) is
+    if name == "" is
+        write("  \x1b[31merror:\x1b[0m Usage: vira new <name>")
+        exit(1)
+    end
+    if dir_exists(name) is
+        write("  \x1b[31merror:\x1b[0m directory '" + name + "' already exists")
+        exit(1)
+    end
+
+    dir_create(name)
+    dir_create(name + "/src")
+    dir_create(name + "/build")
+    dir_create(name + "/build/cache")
+    dir_create(name + "/tests")
+    dir_create(name + "/docs")
+
+    if is_ws is
+        file_write(name + "/Bytes.hk", manifest::template_workspace(name))
+        dir_create(name + "/" + name + "-core/src")
+        file_write(name + "/" + name + "-core/Bytes.hk",
+            "[package]\n-> name => " + name + "-core\n-> version => 0.1.0\n\n" +
+            "[build]\n-> lang  => h#\n-> entry => src/main.h#\n")
+        file_write(name + "/" + name + "-core/src/main.h#", manifest::template_main_source(name + "-core"))
+    else if is_lib is
+        file_write(name + "/Bytes.hk", manifest::template_library(name))
+        file_write(name + "/src/lib.h#", manifest::template_lib_source(name))
+    else is
+        file_write(name + "/Bytes.hk", manifest::template_binary(name))
+        file_write(name + "/src/main.h#", manifest::template_main_source(name))
+    end
+
+    file_write(name + "/.gitignore", manifest::template_gitignore())
+
+    write("  \x1b[32mCreated:\x1b[0m \x1b[1m" + name + "\x1b[0m" +
+          if is_ws then " (workspace)" else if is_lib then " (library)" else " (binary)")
+    write("  \x1b[2mEntry:  \x1b[0m " + if is_lib then "src/lib.h#" else "src/main.h#")
+    write("  \x1b[2mConfig: \x1b[0m Bytes.hk")
+    write("")
+    write("  \x1b[1mNext:\x1b[0m  cd " + name + " && vira run")
+    write("")
+end
+
+;; ── build / run / check / clean ──────────────────────────────────────────────
+
+pub fn cmd_build(extra: [string], extra_count: int, release: bool, verbose: bool) is
+    print_banner()
+    let m: manifest::Manifest = manifest::load()
+
+    if m.is_workspace is
+        let tmp: string = "/tmp/vira_cwd_" + to_string(proc_id()) + ".txt"
+        let cwd: string = if system("pwd > " + tmp + " 2>&1") == 0 then string_trim(file_read(tmp)) else "."
+        system("export VIRA_WORKSPACE_ROOT=" + cwd)
+
+        ;; `vira build --release <member>` builds only that one member.
+        if extra_count > 0 && !string_starts_with(extra[0], "-") is
+            let rc: int = workspace::build_one_member(m, extra[0], release, verbose)
+            if rc != 0 is exit(rc) end
+            return
+        end
+
+        let rc: int = workspace::build_all_members(m, release, verbose)
+        if rc != 0 is exit(rc) end
+        return
+    end
+
+    let entry: string = if extra_count > 0 && !string_starts_with(extra[0], "-") then extra[0]
+                         else manifest::build_entry(m)
+    let out: string = manifest::build_output(m)
+    let hsh: string = find_h_sharp()
+
+    if !dir_exists("build")       is dir_create("build")       end
+    if !dir_exists("build/cache") is dir_create("build/cache") end
+
+    if manifest::deps_len(m) > 0 is
+        store::ensure_store()
+        fetcher::install_all(m, release, verbose)
+    end
+
+    let mut emit_arg: string = ""
+    if m.build.emit != "" && m.build.emit != "bin" is emit_arg = " --emit " + m.build.emit end
+
+    let extra_flags: string = if m.build.flags != "" then " " + m.build.flags else ""
+
+    let mut cmd: string = hsh + " compile " + entry + " -o " + out + emit_arg + extra_flags
+    if release is cmd = cmd + " --release" end
+    if verbose is cmd = cmd + " --verbose" end
+
+    write("  \x1b[2mBuilding \x1b[0m\x1b[1m" + manifest::pkg_name(m) +
+          "\x1b[0m v" + manifest::pkg_version(m) +
+          if release then " \x1b[33m(release)\x1b[0m" else "")
+    write("")
+
+    let t0: int = time_ms()
+    let rc: int = system(cmd)
+    let elapsed: int = time_ms() - t0
+
+    if rc == 0 is
+        write("  \x1b[32m✓\x1b[0m  " + out + "  \x1b[2m(" + ui::elapsed_str(elapsed) + ")\x1b[0m")
+    else is
+        write("  \x1b[31merror:\x1b[0m build failed (" + ui::elapsed_str(elapsed) + ")")
+        if !release is write("  \x1b[2mhint: try 'vira build --release' for full LLVM diagnostics\x1b[0m") end
+        exit(1)
+    end
+    write("")
+end
+
+pub fn cmd_run(file: string, run_args: [string], run_argc: int, release: bool, verbose: bool) is
+    if file != "" && !file_exists(file) is
+        write("  \x1b[31merror:\x1b[0m file not found: " + file)
+        exit(1)
+    end
+
+    let m: manifest::Manifest = manifest::load()
+    let entry: string = if file != "" then file else manifest::build_entry(m)
+    let out:   string = manifest::build_output(m)
+    let hsh:   string = find_h_sharp()
+    let mut cmd: string = hsh + " compile " + entry + " -o " + out
+    if release is cmd = cmd + " --release" end
+
+    if !dir_exists("build")       is dir_create("build")       end
+    if !dir_exists("build/cache") is dir_create("build/cache") end
+
+    if manifest::deps_len(m) > 0 is
+        store::ensure_store()
+        fetcher::install_all(m, release, verbose)
+    end
+
+    let rc: int = system(cmd)
+    if rc != 0 is
+        write("  \x1b[31merror:\x1b[0m compilation failed")
+        exit(1)
+    end
+
+    write("  \x1b[2mRunning " + out + "\x1b[0m\n")
+
+    let mut run_cmd: string = "./" + out
+    let mut i: int = 0
+    while i < run_argc is
+        run_cmd = run_cmd + " " + run_args[i]
+        i += 1
+    end
+    exit(system(run_cmd))
+end
+
+pub fn cmd_check(extra: [string], extra_count: int, verbose: bool) is
+    let m: manifest::Manifest = manifest::load()
+    let hsh: string = find_h_sharp()
+    let entry: string = if extra_count > 0 && !string_starts_with(extra[0], "-") then extra[0]
+                         else manifest::build_entry(m)
+
+    write("  \x1b[2mChecking \x1b[0m" + entry)
+    let t0: int = time_ms()
+    let rc: int = system(hsh + " check " + entry)
+    let ms: int = time_ms() - t0
+
+    if rc == 0 is
+        write("  \x1b[32m✓\x1b[0m  no errors  \x1b[2m(" + ui::elapsed_str(ms) + ")\x1b[0m")
+    end
+    if rc != 0 is exit(rc) end
+end
+
+pub fn cmd_clean(everything: bool) is
+    if dir_exists("build") is
+        dir_remove_all("build")
+        write("  \x1b[32m✓\x1b[0m  cleaned build/")
+    end
+    if everything is
+        system("rm -f vira.lock 2>/dev/null")
+        write("  \x1b[32m✓\x1b[0m  removed vira.lock")
+        write("  \x1b[2mNote: cached libraries under ~/.hsharp/bytes-io/ are shared with\x1b[0m")
+        write("  \x1b[2mother projects and are left in place — see 'vira cache'.\x1b[0m")
+    end
+end
+
+;; ── dependency commands ───────────────────────────────────────────────────────
+
+pub fn cmd_add(pkg: string, version: string, release: bool) is
+    print_banner()
+    write("  \x1b[2mAdding\x1b[0m \x1b[33m" + pkg + "\x1b[0m to project...")
+
+    let kind: string = if string_starts_with(pkg, "http") || string_starts_with(pkg, "git") then "git" else "vira"
+    let source: string = if kind == "git" then pkg else version
+
+    fetcher::add_dependency(pkg, kind, source, false)
+end
+
+pub fn cmd_remove(pkg: string) is
+    print_banner()
+    fetcher::remove_dependency(pkg)
+end
+
+pub fn cmd_install(verbose: bool, release: bool) is
+    print_banner()
+    let m: manifest::Manifest = manifest::load()
+
+    if manifest::deps_len(m) == 0 is
+        write("  \x1b[2mNothing to install.\x1b[0m")
+        return
+    end
+
+    store::ensure_store()
+    fetcher::install_all(m, release, verbose)
+end
+
+pub fn cmd_update() is
+    print_banner()
+    write("  \x1b[2mUpdating registry cache...\x1b[0m")
+    if file_exists("build/cache/registry-index.json") is
+        file_delete("build/cache/registry-index.json")
+    end
+    let idx: registry::Index = registry::fetch_fresh()
+    write("  \x1b[32m✓\x1b[0m  Registry updated (" + to_string(registry::index_count(idx)) + " packages)")
+    write("")
+    write("  Run 'vira install' to reinstall dependencies")
+end
+
+pub fn cmd_list() is
+    print_banner()
+    let m: manifest::Manifest = manifest::load()
+
+    write("  \x1b[1mDependencies:\x1b[0m " + manifest::pkg_name(m) + " v" + manifest::pkg_version(m))
+    write("")
+
+    if manifest::deps_len(m) == 0 is
+        write("  \x1b[2m(no dependencies)\x1b[0m")
+        write("")
+        return
+    end
+
+    let mut i: int = 0
+    while i < manifest::deps_len(m) is
+        let dep: manifest::DependencyLine = manifest::dep_at(m, i)
+        let name: string = manifest::dep_name(dep)
+        let kind: string = manifest::dep_kind(dep)
+        let src:  string = manifest::dep_source(dep)
+        let colored_kind: string = match kind is
+            "dynamic" => "\x1b[36mdynamic\x1b[0m"
+            "static"  => "\x1b[33mstatic\x1b[0m"
+            "git"     => "\x1b[35mgit\x1b[0m"
+            "version" => "\x1b[34m" + src + "\x1b[0m"
+            "newest"  => "\x1b[92mnewest\x1b[0m"
+            "path"    => "\x1b[95mpath\x1b[0m"
+            "invalid" => "\x1b[31minvalid\x1b[0m"
+            _         => "\x1b[32mvira\x1b[0m"
+        end
+        write("  " + string_pad_right(name, 24) + " " + colored_kind +
+              if src != kind && src != "" then "  \x1b[2m" + src + "\x1b[0m" else "" end)
+        i += 1
+    end
+    write("")
+end
+
+pub fn cmd_search(query: string) is
+    print_banner()
+    write("  \x1b[2mSearching registry for '" + query + "'...\x1b[0m")
+    let idx: registry::Index = registry::load_cached()
+    let hits: [registry::PackageRef] = registry::search(idx, query)
+    let n: int = array_len(hits)
+
+    if n == 0 is
+        write("  \x1b[2mNo packages found for '" + query + "'\x1b[0m")
+        write("")
+        return
+    end
+
+    write("  \x1b[1m" + to_string(n) + " package(s) found:\x1b[0m")
+    write("")
+    let mut i: int = 0
+    while i < n is
+        let p: registry::PackageRef = hits[i]
+        write("  \x1b[36m" + string_pad_right(registry::ref_name(p), 24) + "\x1b[0m  " + registry::ref_git(p))
+        i += 1
+    end
+    write("")
+end
+
+pub fn cmd_info_pkg(pkg: string) is
+    print_banner()
+    let idx: registry::Index = registry::load_cached()
+    let entry: registry::PackageRef = registry::find(idx, pkg)
+
+    if registry::ref_name(entry) == "" is
+        write("  \x1b[31merror:\x1b[0m package '" + pkg + "' not found in registry")
+        write("  Try: vira search " + pkg)
+        exit(1)
+    end
+
+    write("  \x1b[1m" + registry::ref_name(entry) + "\x1b[0m")
+    write("  \x1b[2mSource:\x1b[0m  " + registry::ref_git(entry))
+    write("  \x1b[2mVersion:\x1b[0m " + registry::ref_version(entry))
+    write("")
+    write("  vira add " + registry::ref_name(entry))
+    write("")
+end
+
+pub fn cmd_python_pkg(pkg: string, version: string) is
+    print_banner()
+    write("  \x1b[2mInstalling Python package: \x1b[0m" + pkg)
+    let ok: bool = pybridge::install_many([pkg], 1, "3")
+    if ok is
+        write("  \x1b[32m✓\x1b[0m  " + pkg + if version != "" then "@" + version else "")
+    else is
+        write("  \x1b[33mwarn:\x1b[0m install may have failed, check pip output above")
+    end
+end
+
+;; ── workspace ────────────────────────────────────────────────────────────────
+
+pub fn cmd_workspace(sub: string, extra: [string], extra_count: int, release: bool, verbose: bool) is
+    match sub is
+        "info" | "status" => is
+            print_banner()
+            let m: manifest::Manifest = manifest::load()
+            if !m.is_workspace is
+                write("  \x1b[2mNot a workspace (no [workspace] in Bytes.hk)\x1b[0m")
+                return
+            end
+            write("  \x1b[1mWorkspace:\x1b[0m " + manifest::ws_name(m) + " v" + manifest::ws_version(m))
+            write("  \x1b[2mMode:\x1b[0m      " + manifest::ws_mode(m))
+            let members: [string] = manifest::ws_members(m)
+            write("  \x1b[2mMembers (" + to_string(array_len(members)) + "):\x1b[0m")
+            let mut i: int = 0
+            while i < array_len(members) is
+                let name: string = members[i]
+                write("    \x1b[36m" + string_pad_right(name, 20) + "\x1b[0m  " + manifest::ws_member_lang(m, name))
+                i += 1
+            end
+            write("")
+        end
+        "build" => is
+            cmd_build(extra, extra_count, release, verbose)
+        end
+        "list" => is
+            print_banner()
+            let m: manifest::Manifest = manifest::load()
+            let members: [string] = manifest::ws_members(m)
+            let mut i: int = 0
+            while i < array_len(members) is
+                let name: string = members[i]
+                let lang: string = manifest::ws_member_lang(m, name)
+                let built: bool = file_exists(name + "/build/main")
+                let mark: string = if built then "\x1b[32m✓\x1b[0m" else "\x1b[2m○\x1b[0m"
+                write("  " + mark + " " + string_pad_right(name, 20) + "  \x1b[2m" + lang + "\x1b[0m")
+                i += 1
+            end
+            write("")
+        end
+        _ => is
+            write("  \x1b[31merror:\x1b[0m Unknown workspace subcommand: " + sub)
+            write("  Available: info build list")
+        end
+    end
+end
+
+;; ── cache ────────────────────────────────────────────────────────────────────
+
+pub fn cmd_cache_info() is
+    print_banner()
+    write("  \x1b[1mVira cache:\x1b[0m")
+    write("    \x1b[2mLibraries (global):\x1b[0m  " + store::packages_root())
+    write("    \x1b[2mPython venv (global):\x1b[0m " + store::pyenv_root())
+    write("    \x1b[2mBuild cache (local):\x1b[0m  build/cache/")
+    write("")
+    system("du -sh " + store::packages_root() + " 2>/dev/null | awk '{{print \"    Libraries size: \" $1}}'")
+    system("du -sh " + store::pyenv_root()    + " 2>/dev/null | awk '{{print \"    Venv size:      \" $1}}'")
+    system("du -sh build/cache/ 2>/dev/null | awk '{{print \"    Local size:     \" $1}}'")
+    write("")
+end
+
+;; ── settings ─────────────────────────────────────────────────────────────────
+
+fn read_input(prompt: string) -> string is
+    io_print(prompt)
+    let tmp: string = "/tmp/.vira_settings_input_" + to_string(proc_id()) + "_" + to_string(time_ms())
+    system("read -r __vira_in; printf '%s' \"$__vira_in\" > '" + tmp + "'")
+    let val: string = string_trim(file_read(tmp))
+    system("rm -f '" + tmp + "'")
+    return val
+end
+
+pub fn cmd_settings() is
+    write("\x1b[1m\x1b[36mvira settings\x1b[0m")
+    write("  \x1b[2mConfig: " + prefs::prefs_path() + "\x1b[0m")
+    write("")
+    write("  \x1b[1m[1]\x1b[0m Default backend (release/debug)")
+    write("  \x1b[1m[2]\x1b[0m Progress bar style")
+    write("  \x1b[1m[3]\x1b[0m Clear project build cache")
+    write("  \x1b[1m[4]\x1b[0m Show build cache size")
+    write("  \x1b[1m[5]\x1b[0m Show current settings")
+    write("  \x1b[1m[6]\x1b[0m Reset settings to defaults")
+    write("  \x1b[1m[7]\x1b[0m Clear the global library store (~/.hsharp/bytes-io)")
+    write("  \x1b[1m[q]\x1b[0m Quit")
+
+    let choice: string = read_input("\n  Choice: ")
+
+    if choice == "1" is
+        let backend: string = read_input("  Backend [release/debug]: ")
+        prefs::set("backend", backend)
+        write("  \x1b[32m✓\x1b[0m saved")
+    else if choice == "2" is
+        write("")
+        let names: [string] = ui::theme_names()
+        let current: string = prefs::get("bar_theme", "default")
+        let mut i: int = 0
+        while i < array_len(names) is
+            let marker: string = if names[i] == current then "\x1b[32m*\x1b[0m" else " "
+            write("  " + marker + " \x1b[1m[" + to_string(i + 1) + "]\x1b[0m " +
+                  string_pad_right(names[i], 9) + " \x1b[36m" + ui::theme_preview(names[i]) + "\x1b[0m")
+            i += 1
+        end
+        let pick: string = read_input("\n  Choice: ")
+        let idx: int = to_int(pick) - 1
+        if idx >= 0 && idx < array_len(names) is
+            prefs::set("bar_theme", names[idx])
+            write("  \x1b[32m✓\x1b[0m bar theme set to \x1b[36m" + names[idx] + "\x1b[0m " + ui::theme_preview(names[idx]))
+        else is
+            write("  \x1b[31m✗\x1b[0m invalid choice")
+        end
+    else if choice == "3" is
+        dir_remove_all("build/cache")
+        write("  \x1b[32m✓\x1b[0m build/cache removed")
+    else if choice == "4" is
+        system("du -sh build/cache 2>/dev/null | awk '{{print \"  Cache: \" $1}}' || echo '  Cache: 0'")
+    else if choice == "5" is
+        let dump: string = prefs::dump()
+        if dump == "" is
+            write("  \x1b[2m(no settings saved yet — using built-in defaults)\x1b[0m")
+        else is
+            write("")
+            write("  \x1b[2m" + prefs::prefs_path() + "\x1b[0m")
+            write(dump)
+        end
+    else if choice == "6" is
+        prefs::reset()
+        write("  \x1b[32m✓\x1b[0m settings reset to defaults")
+    else if choice == "7" is
+        store::wipe_packages()
+        store::wipe_pyenv()
+        write("  \x1b[32m✓\x1b[0m " + store::packages_root() + " and " + store::pyenv_root() + " cleared")
+        write("  \x1b[2mEvery project's next build/install will re-fetch what it needs.\x1b[0m")
+    end
+end
+
+pub fn cmd_langs() is
+    print_banner()
+    write("  \x1b[1mSupported languages in workspace-special:\x1b[0m")
+    write("")
+    let langs: [[string]] = [
+        ["h#",      "H# (H-Sharp)  — primary language"],
+        ["rust",    "Rust          — cargo build"],
+        ["c++",     "C++           — g++/clang++"],
+        ["c",       "C             — gcc/clang"],
+        ["odin",    "Odin          — odin build"],
+        ["zig",     "Zig           — zig build"],
+        ["crystal", "Crystal       — crystal build"],
+        ["go",      "Go            — go build"],
+        ["python",  "Python        — syntax check only"],
+    ]
+    let mut i: int = 0
+    while i < array_len(langs) is
+        write("    \x1b[36m" + string_pad_right(langs[i][0], 10) + "\x1b[0m  " + langs[i][1])
+        i += 1
+    end
+    write("")
+end
