@@ -1,0 +1,143 @@
+pub struct LockedDep is
+    pub name:     string
+    pub version:  string
+    pub url:      string
+    pub checksum: string
+end
+
+;; Same-module accessors — see manifest.h#'s note on why a cross-module
+;; `.field` read on a struct with a common field name (`name` here also
+;; belongs to `DependencyLine`) isn't safe to do directly.
+pub fn locked_name(p: LockedDep)    -> string is return p.name    end
+pub fn locked_version(p: LockedDep) -> string is return p.version end
+
+pub struct LockSet is
+    pub entries: [LockedDep]
+    pub count:   int
+    pub schema:  int
+end
+
+fn lock_file_path() -> string is return "vira.lock" end
+
+pub fn read_lock() -> LockSet is
+    if !file_exists(lock_file_path()) is
+        return LockSet { entries: [], count: 0, schema: 1 }
+    end
+    return parse_lock(file_read(lock_file_path()))
+end
+
+fn read_json_field(block: string, key: string) -> string is
+    let needle: string = "\"" + key + "\":"
+    let at: int = string_find(block, needle)
+    if at < 0 is return "" end
+    let after: string = squeeze(string_slice(block, at + string_len(needle), string_len(block)))
+    if !string_starts_with(after, "\"") is return "" end
+    let inner: string = string_slice(after, 1, string_len(after))
+    let close: int = string_find(inner, "\"")
+    if close < 0 is return "" end
+    return string_slice(inner, 0, close)
+end
+
+fn squeeze(s: string) -> string is return string_trim(s) end
+
+fn parse_lock(json: string) -> LockSet is
+    let mut entries: [LockedDep] = []
+    let mut count:   int         = 0
+
+    let anchor: int = string_find(json, "\"packages\"")
+    if anchor < 0 is return LockSet { entries: [], count: 0, schema: 1 } end
+
+    let after_key: string = string_slice(json, anchor + 10, string_len(json))
+    let open_brace: int = string_find(after_key, "{")
+    if open_brace < 0 is return LockSet { entries: [], count: 0, schema: 1 } end
+
+    let body: string = string_slice(after_key, open_brace + 1, string_len(after_key))
+    let tokens: [string] = string_split(body, "\"")
+    let total: int = array_len(tokens)
+    let mut i: int = 0
+
+    while i + 2 < total is
+        let candidate: string = squeeze(tokens[i])
+        if string_len(candidate) > 0 &&
+           !string_starts_with(candidate, "{") && !string_starts_with(candidate, "}") &&
+           !string_starts_with(candidate, ",") && !string_starts_with(candidate, ":") is
+
+            let start: int = string_find(body, "\"" + candidate + "\"")
+            if start >= 0 is
+                let rest: string = string_slice(body, start + string_len(candidate) + 2, string_len(body))
+                let ob: int = string_find(rest, "{")
+                let cb: int = string_find(rest, "}")
+                if ob >= 0 && cb > ob is
+                    let block: string = string_slice(rest, ob, cb + 1)
+                    entries = array_push(entries, LockedDep {
+                        name:     candidate,
+                        version:  read_json_field(block, "version"),
+                        url:      read_json_field(block, "url"),
+                        checksum: read_json_field(block, "checksum"),
+                    })
+                    count += 1
+                end
+            end
+        end
+        i += 2
+    end
+
+    return LockSet { entries: entries, count: count, schema: 1 }
+end
+
+pub fn write_lock(set: LockSet) is
+    let mut out: string = "{\n  \"schema\": " + to_string(set.schema) + ",\n  \"packages\": {\n"
+    let mut i: int = 0
+    while i < set.count is
+        let p: LockedDep = set.entries[i]
+        let comma: string = if i < set.count - 1 then "," else ""
+        out = out + "    \"" + p.name + "\": {\n" +
+              "      \"version\": \""  + p.version  + "\",\n" +
+              "      \"url\": \""      + p.url      + "\",\n" +
+              "      \"checksum\": \"" + p.checksum + "\"\n" +
+              "    }" + comma + "\n"
+        i += 1
+    end
+    out = out + "  }\n}\n"
+    file_write(lock_file_path(), out)
+end
+
+pub fn lock_set(set: LockSet, name: string, version: string, url: string, checksum: string) -> LockSet is
+    let mut entries: [LockedDep] = []
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < set.count is
+        if set.entries[i].name == name is
+            entries   = array_push(entries, LockedDep { name: name, version: version, url: url, checksum: checksum })
+            replaced  = true
+        else is
+            entries = array_push(entries, set.entries[i])
+        end
+        i += 1
+    end
+    if !replaced is
+        entries = array_push(entries, LockedDep { name: name, version: version, url: url, checksum: checksum })
+    end
+    return LockSet { entries: entries, count: array_len(entries), schema: set.schema }
+end
+
+pub fn lock_unset(set: LockSet, name: string) -> LockSet is
+    let mut entries: [LockedDep] = []
+    let mut i: int = 0
+    while i < set.count is
+        if set.entries[i].name != name is
+            entries = array_push(entries, set.entries[i])
+        end
+        i += 1
+    end
+    return LockSet { entries: entries, count: array_len(entries), schema: set.schema }
+end
+
+pub fn lock_get(set: LockSet, name: string) -> LockedDep is
+    let mut i: int = 0
+    while i < set.count is
+        if set.entries[i].name == name is return set.entries[i] end
+        i += 1
+    end
+    return LockedDep { name: "", version: "", url: "", checksum: "" }
+end
