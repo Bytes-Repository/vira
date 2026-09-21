@@ -1,1 +1,160 @@
+mod shell
 
+extern dynamic [c] is
+    fn exit(code: int)
+end
+
+fn main() is
+    let args: [string] = env::args()
+    let argc: int = array_len(args)
+
+    let mut release: bool = false
+    let mut verbose: bool = false
+    let mut file:    string = ""
+    let mut cmd:     string = ""
+    let mut extra:   [string] = []
+
+    let mut i: int = 1   ;; skip argv[0]
+    while i < argc is
+        let a: string = args[i]
+        match a is
+            "--version" | "-V" => is shell::print_version() return end
+            "--help"    | "-h" => is shell::print_help()    return end
+            "--release" | "-r" => is release = true end
+            "--verbose" | "-v" => is verbose = true end
+            "--file"    | "-f" => is
+                i += 1
+                if i < argc is file = args[i] end
+            end
+            _ => is
+                if string_starts_with(a, "-") is
+                    extra = array_push(extra, a)
+                else if cmd == "" is
+                    cmd = a
+                else is
+                    extra = array_push(extra, a)
+                end
+            end
+        end
+        i += 1
+    end
+
+    if cmd == "" is
+        shell::print_help()
+        return
+    end
+
+    let extra_count: int = array_len(extra)
+
+    match cmd is
+        "new" => is
+            let name:   string = shell::arg_at(extra, extra_count, 0)
+            let is_lib: bool   = shell::arg_has(extra, extra_count, "--lib")
+            shell::cmd_new(name, is_lib, false)
+        end
+        "new-workspace" | "new-ws" => is
+            let name: string = shell::arg_at(extra, extra_count, 0)
+            shell::cmd_new(name, false, true)
+        end
+        "build" => is
+            shell::cmd_build(extra, extra_count, release, verbose)
+        end
+        "run" => is
+            let run_file: string = if file != "" then file
+                                    else if extra_count > 0 && string_ends_with(extra[0], ".h#") then extra[0]
+                                    else ""
+            let run_args: [string] = if run_file != "" && extra_count > 0 then
+                shell::args_from(extra, extra_count, 1)
+            else extra
+            let run_argc: int = array_len(run_args)
+            shell::cmd_run(run_file, run_args, run_argc, release, verbose)
+        end
+        "check" => is
+            shell::cmd_check(extra, extra_count, verbose)
+        end
+        "clean" => is
+            let everything: bool = shell::arg_has(extra, extra_count, "--everything")
+            shell::cmd_clean(everything)
+        end
+        "test" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            let filter: string = shell::arg_at(positional, array_len(positional), 0)
+            let rc: int = tester::cmd_test(extra, extra_count, filter, verbose)
+            if rc != 0 is exit(rc) end
+        end
+        "fmt" | "format" => is
+            let rc: int = fmt::cmd_fmt(extra, extra_count, verbose)
+            if rc != 0 is exit(rc) end
+        end
+        "doc" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            let out_dir: string = shell::arg_at(positional, array_len(positional), 0)
+            let rc: int = docs::cmd_doc(out_dir, verbose)
+            if rc != 0 is exit(rc) end
+        end
+        "add" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            let pcount: int = array_len(positional)
+            let pkg:     string = shell::arg_at(positional, pcount, 0)
+            let version: string = shell::arg_at(positional, pcount, 1)
+            if string_starts_with(pkg, "python:") || string_starts_with(pkg, "py:") is
+                let py_name: string = string_replace(string_replace(pkg, "python:", ""), "py:", "")
+                shell::cmd_python_pkg(py_name, version)
+            else is
+                shell::cmd_add(pkg, version, release)
+            end
+        end
+        "remove" | "rm" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            shell::cmd_remove(shell::arg_at(positional, array_len(positional), 0))
+        end
+        "install" => is
+            shell::cmd_install(verbose, release)
+        end
+        "update" => is
+            shell::cmd_update()
+        end
+        "list" | "ls" => is
+            shell::cmd_list()
+        end
+        "search" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            shell::cmd_search(shell::arg_at(positional, array_len(positional), 0))
+        end
+        "info" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            shell::cmd_info_pkg(shell::arg_at(positional, array_len(positional), 0))
+        end
+        "python" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            let pcount: int = array_len(positional)
+            shell::cmd_python_pkg(shell::arg_at(positional, pcount, 0), shell::arg_at(positional, pcount, 1))
+        end
+        "workspace" | "ws" => is
+            let positional: [string] = shell::args_positional(extra, extra_count)
+            let pcount: int = array_len(positional)
+            let sub: string = shell::arg_at(positional, pcount, 0)
+            let rest: [string] = shell::args_from(positional, pcount, 1)
+            let sub_name: string = if sub == "" then "info" else sub
+            shell::cmd_workspace(sub_name, rest, array_len(rest), release, verbose)
+        end
+        "cache" => is
+            shell::cmd_cache_info()
+        end
+        "settings" => is
+            shell::cmd_settings()
+        end
+        "langs" | "languages" => is
+            shell::cmd_langs()
+        end
+        _ => is
+            if string_ends_with(cmd, ".h#") || string_ends_with(cmd, ".hsp") is
+                shell::cmd_run(cmd, extra, extra_count, release, verbose)
+            else is
+                write("  \x1b[31merror:\x1b[0m unknown command '" + cmd + "'")
+                write("  Run 'vira --help' for usage")
+                exit(1)
+            end
+        end
+    end
+end
