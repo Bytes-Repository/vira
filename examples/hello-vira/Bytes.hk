@@ -1,0 +1,27 @@
+[package]
+-> name        => hello-vira
+-> version     => 0.1.0
+-> description => Minimal example project, buildable with either bytes or vira
+-> author      => Bytes Developers
+-> license     => MIT
+
+[build]
+-> lang   => h#
+-> entry  => src/main.h#
+-> output => build/hello-vira
+
+[deps]
+;; A plain registry lookup — vira fetches this once into
+;; ~/.hsharp/bytes-io/packages/, and any other project on this machine
+;; that also depends on it reuses the same fetch instead of downloading
+;; its own copy.
+-> hprompt => 
+
+;; A pinned version — same tag-checkout behaviour bytes uses.
+;; -> somejsonlib => v1.2
+
+;; A sibling package that already lives on disk.
+;; -> shared-utils => ../shared-utils
+
+;; A system library — linked, never fetched.
+-> libc => dynamic
