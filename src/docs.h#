@@ -1,0 +1,276 @@
+extern dynamic [c] is
+    fn system(cmd: string) -> int
+end
+
+pub struct DocEntry is
+    pub kind:      string
+    pub name:      string
+    pub signature: string
+    pub doc:       string
+    pub module:    string
+    pub file:      string
+    pub line:      int
+end
+
+fn escape(s: string) -> string is
+    let s: string = string_replace(s, "&", "&amp;")
+    let s: string = string_replace(s, "<", "&lt;")
+    let s: string = string_replace(s, ">", "&gt;")
+    return string_replace(s, "\"", "&quot;")
+end
+
+fn safe_filename(s: string) -> string is
+    let chars: [string] = string_chars(s)
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < array_len(chars) is
+        let c: string = chars[i]
+        if (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") ||
+           (c >= "0" && c <= "9") || c == "_" || c == "-" is
+            out = out + c
+        else is
+            out = out + "_"
+        end
+        i += 1
+    end
+    return out
+end
+
+fn gather_source_files() -> [string] is
+    let tmp: string = "/tmp/vira_doc_scan_" + to_string(proc_id()) + ".txt"
+    for d in ["src", "std", "."] is
+        if dir_exists(d) is
+            system("find " + d + " -name '*.h#' ! -path './build/*' -maxdepth 5 2>/dev/null | sort >> " + tmp)
+        end
+    end
+    let content: string = file_read(tmp)
+    file_delete(tmp)
+    if content == "" is
+        let empty: [string] = []
+        return empty
+    end
+    let lines: [string] = string_split(content, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < array_len(lines) is
+        let l: string = string_trim(lines[i])
+        if l != "" is out = array_push(out, l) end
+        i += 1
+    end
+    return out
+end
+
+fn file_stem(path: string) -> string is
+    let slash: int = string_rfind(path, "/")
+    let base: string = if slash >= 0 then string_slice(path, slash + 1, string_len(path)) else path
+    let dot: int = string_rfind(base, ".")
+    if dot >= 0 is return string_slice(base, 0, dot) end
+    return base
+end
+
+fn parse_signature(line: string, doc: string, module: string, file: string, ln: int) -> DocEntry is
+    let empty: DocEntry = DocEntry { kind: "", name: "", signature: "", doc: "", module: module, file: file, line: ln }
+    let l: string = if string_starts_with(line, "pub ") then string_slice(line, 4, string_len(line)) else line
+
+    if string_starts_with(l, "fn ") is
+        let rest: string = string_slice(l, 3, string_len(l))
+        let paren: int = string_find(rest, "(")
+        let name: string = if paren >= 0 then string_trim(string_slice(rest, 0, paren)) else rest
+        return DocEntry { kind: "fn", name: name, signature: line, doc: doc, module: module, file: file, line: ln }
+    end
+    if string_starts_with(l, "struct ") is
+        let rest: string = string_slice(l, 7, string_len(l))
+        let sp: int = string_find(rest, " ")
+        let name: string = if sp >= 0 then string_slice(rest, 0, sp) else rest
+        return DocEntry { kind: "struct", name: name, signature: line, doc: doc, module: module, file: file, line: ln }
+    end
+    if string_starts_with(l, "enum ") is
+        let rest: string = string_slice(l, 5, string_len(l))
+        let sp: int = string_find(rest, " ")
+        let name: string = if sp >= 0 then string_slice(rest, 0, sp) else rest
+        return DocEntry { kind: "enum", name: name, signature: line, doc: doc, module: module, file: file, line: ln }
+    end
+    if string_starts_with(l, "trait ") is
+        let rest: string = string_slice(l, 6, string_len(l))
+        let sp: int = string_find(rest, " ")
+        let name: string = if sp >= 0 then string_slice(rest, 0, sp) else rest
+        return DocEntry { kind: "trait", name: name, signature: line, doc: doc, module: module, file: file, line: ln }
+    end
+    return empty
+end
+
+fn extract_entries(src: string, file: string) -> [DocEntry] is
+    let module: string = file_stem(file)
+    let lines: [string] = string_split(src, "\n")
+    let n: int = array_len(lines)
+    let mut entries: [DocEntry] = []
+    let mut i: int = 0
+
+    while i < n is
+        if string_starts_with(string_trim(lines[i]), "///") is
+            let mut doc: string = ""
+            while i < n && string_starts_with(string_trim(lines[i]), "///") is
+                let t: string = string_trim(lines[i])
+                let piece: string = string_trim(string_slice(t, 3, string_len(t)))
+                if doc != "" is doc = doc + "\n" end
+                doc = doc + piece
+                i += 1
+            end
+            while i < n && string_trim(lines[i]) == "" is i += 1 end
+            if i < n is
+                let entry: DocEntry = parse_signature(string_trim(lines[i]), doc, module, file, i + 1)
+                if entry.kind != "" is entries = array_push(entries, entry) end
+            end
+        else is
+            i += 1
+        end
+    end
+    return entries
+end
+
+fn unique_modules(entries: [DocEntry], count: int) -> [string] is
+    let mut mods: [string] = []
+    let mut i: int = 0
+    while i < count is
+        let m: string = entries[i].module
+        let mut found: bool = false
+        let mut j: int = 0
+        while j < array_len(mods) is
+            if mods[j] == m is found = true end
+            j += 1
+        end
+        if !found is mods = array_push(mods, m) end
+        i += 1
+    end
+    return mods
+end
+
+fn render_index(entries: [DocEntry], count: int) -> string is
+    let mut html: string = "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"UTF-8\">" +
+        "<title>H# Documentation</title>\n<style>\n" +
+        "body{font-family:'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;margin:0}\n" +
+        ".header{background:#161b22;padding:24px 40px;border-bottom:1px solid #30363d}\n" +
+        ".header h1{margin:0;color:#58a6ff;font-size:1.8rem}\n" +
+        ".content{padding:32px 40px;max-width:1100px;margin:0 auto}\n" +
+        ".item{background:#161b22;border:1px solid #30363d;border-radius:8px;margin:16px 0;padding:20px}\n" +
+        ".kind{font-size:.75rem;color:#79c0ff;text-transform:uppercase;letter-spacing:1px}\n" +
+        ".name{font-size:1.2rem;font-weight:bold;color:#f0f6fc;margin:4px 0}\n" +
+        ".sig{font-family:monospace;color:#d2a8ff;font-size:.9rem;background:#0d1117;padding:8px 12px;border-radius:4px;margin:8px 0}\n" +
+        ".doc{color:#c9d1d9;line-height:1.6;white-space:pre-wrap}\n" +
+        "a{color:#58a6ff} a:hover{text-decoration:underline}\n" +
+        "h2{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:8px}\n" +
+        "</style></head><body>\n" +
+        "<div class=\"header\"><h1>H# Documentation</h1>" +
+        "<p style=\"color:#8b949e\">Generated by <code>vira doc</code></p></div>\n" +
+        "<div class=\"content\">\n"
+
+    let modules: [string] = unique_modules(entries, count)
+    let mut mi: int = 0
+    while mi < array_len(modules) is
+        let module: string = modules[mi]
+        let mut mod_count: int = 0
+        let mut k: int = 0
+        while k < count is
+            if entries[k].module == module is mod_count += 1 end
+            k += 1
+        end
+        html = html + "<h2><a href=\"" + safe_filename(module) + ".html\">" + escape(module) +
+               "</a> (" + to_string(mod_count) + " items)</h2>\n"
+
+        k = 0
+        while k < count is
+            let it: DocEntry = entries[k]
+            if it.module == module is
+                html = html + "<div class=\"item\">" +
+                    "<div class=\"kind\">" + escape(it.kind) + "</div>" +
+                    "<div class=\"name\">" + escape(it.name) + "</div>" +
+                    "<div class=\"sig\">" + escape(it.signature) + "</div>" +
+                    "<div class=\"doc\">" + escape(it.doc) + "</div></div>\n"
+            end
+            k += 1
+        end
+        mi += 1
+    end
+
+    html = html + "</div></body></html>\n"
+    return html
+end
+
+fn render_module_page(module: string, entries: [DocEntry], count: int) -> string is
+    let mut html: string = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\">" +
+        "<title>H# - " + escape(module) + "</title></head>" +
+        "<body style=\"font-family:sans-serif;background:#0d1117;color:#e6edf3;padding:32px\">" +
+        "<h1 style=\"color:#58a6ff\">" + escape(module) + "</h1>" +
+        "<p><a href=\"index.html\" style=\"color:#58a6ff\">← Back to index</a></p>\n"
+
+    let mut i: int = 0
+    while i < count is
+        let it: DocEntry = entries[i]
+        html = html + "<div style=\"background:#161b22;border:1px solid #30363d;" +
+            "border-radius:8px;margin:16px 0;padding:20px\">" +
+            "<div style=\"color:#79c0ff;font-size:.75rem\">" + escape(it.kind) + "</div>" +
+            "<div style=\"color:#f0f6fc;font-weight:bold\">" + escape(it.name) + "</div>" +
+            "<pre style=\"color:#d2a8ff;background:#0d1117;padding:8px;border-radius:4px\">" +
+            escape(it.signature) + "</pre>" +
+            "<div style=\"color:#c9d1d9;white-space:pre-wrap\">" + escape(it.doc) + "</div></div>\n"
+        i += 1
+    end
+
+    html = html + "</body></html>\n"
+    return html
+end
+
+pub fn cmd_doc(out_dir_arg: string, verbose: bool) -> int is
+    write("")
+    write("  \x1b[1;36mvira doc\x1b[0m  H# Doc Generator")
+    write("")
+
+    let out_dir: string = if out_dir_arg != "" then out_dir_arg else "docs/generated"
+    if !dir_exists(out_dir) is dir_create(out_dir) end
+
+    let files: [string] = gather_source_files()
+    if array_len(files) == 0 is
+        write("  \x1b[2mNo .h# files found.\x1b[0m")
+        return 0
+    end
+
+    let mut all: [DocEntry] = []
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < array_len(files) is
+        let file: string = files[i]
+        if file_exists(file) is
+            let found: [DocEntry] = extract_entries(file_read(file), file)
+            let mut j: int = 0
+            while j < array_len(found) is
+                all   = array_push(all, found[j])
+                total += 1
+                j += 1
+            end
+        end
+        i += 1
+    end
+
+    file_write(out_dir + "/index.html", render_index(all, total))
+
+    let modules: [string] = unique_modules(all, total)
+    let mut mi: int = 0
+    while mi < array_len(modules) is
+        let module: string = modules[mi]
+        let mut mod_entries: [DocEntry] = []
+        let mut mod_count: int = 0
+        let mut j: int = 0
+        while j < total is
+            if all[j].module == module is
+                mod_entries = array_push(mod_entries, all[j])
+                mod_count += 1
+            end
+            j += 1
+        end
+        file_write(out_dir + "/" + safe_filename(module) + ".html", render_module_page(module, mod_entries, mod_count))
+        mi += 1
+    end
+
+    write("  \x1b[32m✓\x1b[0m  " + to_string(total) + " item(s) documented → \x1b[36m" + out_dir + "/index.html\x1b[0m")
+    return 0
+end
